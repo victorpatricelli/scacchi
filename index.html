@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Scacchiera di Vik</title>
+<meta name="description" content="Analisi delle partite di Chess.com con Stockfish 17: revisione mossa per mossa, statistiche e puzzle dai tuoi errori.">
+<meta name="theme-color" content="#22201e">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Rubik:wght@400;500;600;700;800&display=swap">
+<link rel="stylesheet" href="css/app.css">
+<link rel="modulepreload" href="js/app.js">
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="logo"><img src="icons/icon-192.png" alt=""> Scacchiera di Vik</div>
+    <span id="miniProg" class="pill" hidden></span>
+  </header>
+
+  <!-- PARTITE -->
+  <section id="v-games" class="view"></section>
+  <!-- REVISIONE -->
+  <section id="v-review" class="view" hidden>
+    <div class="rv">
+      <div class="stack" style="gap:8px">
+        <div class="playerbar" id="pTop"></div>
+        <div class="boardwrap">
+          <div class="evalbar" id="evalbar"><div class="f" id="evalF"></div><div class="t" id="evalT"></div></div>
+          <div id="rvBoard"></div>
+        </div>
+        <div class="playerbar" id="pBot"></div>
+        <div class="coach" id="coach"></div>
+        <div class="ctrls">
+          <button class="icon-btn" id="cFirst" aria-label="Inizio"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 5h2v14H6zM20 5v14L9 12z"/></svg></button>
+          <button class="icon-btn" id="cPrev" aria-label="Indietro"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M16 4v16L5 12z"/></svg></button>
+          <button class="icon-btn" id="cNext" aria-label="Avanti"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 4v16l11-8z"/></svg></button>
+          <button class="icon-btn" id="cLast" aria-label="Fine"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M16 5h2v14h-2zM4 5v14l11-7z"/></svg></button>
+          <button class="icon-btn" id="cFlip" aria-label="Gira la scacchiera"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4v16M7 20l-3-3M7 20l3-3M17 20V4M17 4l-3 3M17 4l3 3"/></svg></button>
+          <button class="icon-btn" id="cExplore" aria-label="Esplora con il motore"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg></button>
+        </div>
+      </div>
+      <div class="rv-side stack">
+        <div class="tabs2" role="tablist">
+          <button role="tab" id="tMoves" aria-selected="true">Mosse</button>
+          <button role="tab" id="tSum" aria-selected="false">Riepilogo</button>
+        </div>
+        <div id="rvMoves" class="stack">
+          <svg class="graph" id="graph" viewBox="0 0 600 96" preserveAspectRatio="none" role="img" aria-label="Andamento della valutazione"></svg>
+          <div class="moves" id="moves"></div>
+        </div>
+        <div id="rvSum" class="stack" hidden></div>
+      </div>
+    </div>
+  </section>
+  <!-- STATISTICHE -->
+  <section id="v-stats" class="view" hidden></section>
+  <!-- PUZZLE -->
+  <section id="v-puzzle" class="view" hidden></section>
+</div>
+
+<nav class="nav" aria-label="Sezioni"><div class="nav-in" role="tablist">
+  <button data-view="games" aria-selected="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h10"/></svg>Partite</button>
+  <button data-view="review" aria-selected="false"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 3h9v9H3zM12 12h9v9h-9z"/><path d="M12 3h9v9h-9zM3 12h9v9H3z" opacity=".35"/></svg>Revisione</button>
+  <button data-view="stats" aria-selected="false"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="3" y="12" width="4" height="9" rx="1"/><rect x="10" y="7" width="4" height="14" rx="1"/><rect x="17" y="3" width="4" height="18" rx="1"/></svg>Statistiche</button>
+  <button data-view="puzzle" aria-selected="false"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M10 3a2 2 0 0 1 4 0v2h4a1 1 0 0 1 1 1v4h-1.5a2 2 0 1 0 0 4H19v4a1 1 0 0 1-1 1h-4v-1.5a2 2 0 1 0-4 0V21H6a1 1 0 0 1-1-1v-4h2a2 2 0 1 0 0-4H5V6a1 1 0 0 1 1-1h4z"/></svg>Puzzle</button>
+</div></nav>
+<div class="toast" id="toast" hidden></div>
+
+<script src="js/chess.js"></script>
+<script src="js/core.js"></script>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
