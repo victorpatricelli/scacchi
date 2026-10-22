@@ -68,6 +68,44 @@ var Core = (function () {
     for (var i = 0; i < toks.length; i++) { if (/^\d/.test(toks[i])) break; words.push(toks[i]); }
     return words.join(' ').trim() || null;
   }
+  // Header-only metadata: fast, no move replay. Used for lists, sorting, stats.
+  function parseMeta(pgn, username) {
+    var h = parseHeaders(pgn);
+    var u = String(username || '').toLowerCase();
+    var white = h.White || '?', black = h.Black || '?';
+    var userColor = white.toLowerCase() === u ? 'w' : (black.toLowerCase() === u ? 'b' : null);
+    var res = h.Result || '*', outcome = null;
+    if (userColor) {
+      if (res === '1/2-1/2') outcome = 'draw';
+      else if (res === '1-0') outcome = userColor === 'w' ? 'win' : 'loss';
+      else if (res === '0-1') outcome = userColor === 'b' ? 'win' : 'loss';
+    }
+    var date = (h.UTCDate || h.Date || '').replace(/\./g, '-');
+    var time = h.UTCTime || h.StartTime || '00:00:00';
+    var tc = h.TimeControl || '';
+    var body = pgn.replace(/^\[.*\]\s*$/gm, '').replace(/\{[^}]*\}/g, '');
+    var nums = body.match(/\b\d+\.(?!\.)/g);
+    var op = ecoUrlName(h) || h.Opening || (h.ECO ? 'ECO ' + h.ECO : 'Apertura sconosciuta');
+    return {
+      id: gameId(h, pgn), white: white, black: black, whiteElo: +h.WhiteElo || null, blackElo: +h.BlackElo || null,
+      userColor: userColor, result: res, outcome: outcome, termination: h.Termination || '',
+      ts: Date.parse(date + 'T' + time + 'Z') || 0, timeControl: tc, timeClass: timeClass(tc),
+      opening: op, openingFamily: op.split(':')[0].split(',')[0].trim(), eco: h.ECO || '',
+      plies: nums ? nums.length * 2 : 40, link: h.Link || (/^https?:/.test(h.Site || '') ? h.Site : '')
+    };
+  }
+  // Small, storable version of a review (what stats and puzzles need).
+  var KEEP = ['i', 'side', 'san', 'uci', 'piece', 'cls', 'acc', 'loss', 'before', 'phase', 'best', 'clock', 'spent',
+    'missedTactic', 'allowedTactic', 'hungPiece', 'chance', 'converted', 'foundTactic', 'missedMate', 'pv'];
+  function compactReview(game, rv) {
+    return rv.map(function (m) {
+      var o = {};
+      KEEP.forEach(function (k) { if (m[k] != null && m[k] !== false) o[k] = typeof m[k] === 'number' && k !== 'i' ? Math.round(m[k] * 10) / 10 : m[k]; });
+      if (m.side === game.userColor && (m.cls === 'blunder' || m.cls === 'mistake' || m.cls === 'miss')) o.fen = game.fens[m.i];
+      return o;
+    });
+  }
+
   function parseGame(pgn, username) {
     var h = parseHeaders(pgn);
     var ch = new Chess();
@@ -471,13 +509,13 @@ var Core = (function () {
       if (!m.best || m.before < 30) return; // skip lost positions
       var sol = m.pv && m.pv.length ? m.pv.slice(0, 5) : [m.best];
       if (sol.length % 2 === 0) sol = sol.slice(0, sol.length - 1);
-      out.push({ id: game.id + ':' + m.i, gameId: game.id, ply: m.i, fen: game.fens[m.i], solution: sol, played: m.uci, cls: m.cls, theme: m.missedTactic || null, loss: m.loss, ts: game.ts });
+      out.push({ id: game.id + ':' + m.i, gameId: game.id, ply: m.i, fen: m.fen || game.fens[m.i], solution: sol, played: m.uci, cls: m.cls, theme: m.missedTactic || null, loss: m.loss, ts: game.ts });
     });
     return out;
   }
 
   return {
-    START: START, setBook: setBook, epdKey: epdKey, splitPGN: splitPGN, parseHeaders: parseHeaders, parseGame: parseGame,
+    START: START, setBook: setBook, parseMeta: parseMeta, compactReview: compactReview, epdKey: epdKey, splitPGN: splitPGN, parseHeaders: parseHeaders, parseGame: parseGame,
     analyzeGame: analyzeGame, review: review, gameSummary: gameSummary, aggregate: aggregate, puzzlesFrom: puzzlesFrom,
     winPct: winPct, evalText: evalText, packEv: packEv, unpackEv: unpackEv, tacticOf: tacticOf, board: board,
     sanOf: sanOf, pvSan: pvSan, applyUci: applyUci,

@@ -29,7 +29,7 @@ const S = {
   rv: { id: null, ply: 0, flip: false, tab: 'moves', explore: null },
   pz: { list: [], idx: 0, filter: 'todo', step: 0, state: 'idle', progress: {} },
   run: { on: false, engines: [], queue: [], override: {}, done: 0, total: 0, games: 0, gamesTotal: 0, t0: 0, label: '' },
-  syncing: false, syncMsg: ''
+  syncing: false, syncMsg: '', limit: 60
 };
 let rvBoard = null, pzBoard = null, liveEngine = null;
 
@@ -65,25 +65,64 @@ function sound(kind) {
 }
 
 /* ---------------- data ---------------- */
+// Full parse (moves + positions): expensive, only for the game on screen or being analysed. Small LRU cache.
+const LRU = [];
 function game(id) {
   if (!S.parsed[id]) {
     const r = S.recs.get(id); if (!r) return null;
     const g = Core.parseGame(r.pgn, S.settings.user);
-    if (!g) return null;
-    g.id = id; S.parsed[id] = g;
+    if (!g) { r.bad = true; return null; }
+    g.id = id; S.parsed[id] = g; LRU.push(id);
+    if (r.meta && g.opening !== r.meta.opening) { r.meta.opening = g.opening; r.meta.openingFamily = g.openingFamily; r.meta.eco = g.eco; }
+    while (LRU.length > 12) { const old = LRU.shift(); if (old !== S.rv.id) { delete S.parsed[old]; delete S.reviews[old]; } }
   }
   return S.parsed[id];
 }
-function reviewOf(id) {
+// Header metadata: cheap, used everywhere else.
+function meta(id) {
+  const r = S.recs.get(id); if (!r) return null;
+  if (!r.meta || r.meta.user !== S.settings.user.toLowerCase()) {
+    r.meta = Core.parseMeta(r.pgn, S.settings.user); r.meta.user = S.settings.user.toLowerCase(); r.meta.id = id;
+  }
+  return r.meta;
+}
+function reviewOf(id) { // full review of the open game
   const r = S.recs.get(id);
   if (!r || !r.an || r.an.v !== 2) return null;
   if (!S.reviews[id]) { const g = game(id); if (!g) return null; S.reviews[id] = Core.review(g, r.an); }
   return S.reviews[id];
 }
+function crev(id) { // compact stored review, for lists, stats and puzzles
+  const r = S.recs.get(id);
+  if (!r || !r.an || r.an.v !== 2) return null;
+  if (!r.rv || r.rvUser !== S.settings.user.toLowerCase()) return null;
+  return r.rv;
+}
+function buildCompact(id) {
+  const r = S.recs.get(id), g = game(id), rv = reviewOf(id);
+  if (!g || !rv) return null;
+  r.rv = Core.compactReview(g, rv); r.rvUser = S.settings.user.toLowerCase();
+  r.sum = Core.gameSummary(g, rv);
+  return r.rv;
+}
+// Games analysed before compact reviews existed: convert in the background, a few at a time.
+let migrating = false;
+async function migrateCompact() {
+  if (migrating) return; migrating = true;
+  const todo = [...S.recs.keys()].filter((id) => { const r = S.recs.get(id); return r.an && r.an.v === 2 && !crev(id); });
+  let batch = [];
+  for (let i = 0; i < todo.length; i++) {
+    if (buildCompact(todo[i])) batch.push(S.recs.get(todo[i]));
+    if (todo[i] !== S.rv.id) { delete S.parsed[todo[i]]; delete S.reviews[todo[i]]; }
+    if (batch.length >= 10 || i === todo.length - 1) { await store.putGames(batch).catch(() => {}); batch = []; await new Promise((ok) => setTimeout(ok, 30)); }
+  }
+  migrating = false;
+  if (todo.length && (S.view === 'stats' || S.view === 'puzzle')) show(S.view);
+}
 function sortedIds(filterTc) {
-  const ids = [...S.recs.keys()].filter((id) => game(id));
-  ids.sort((a, b) => (game(b).ts || 0) - (game(a).ts || 0));
-  return filterTc && filterTc !== 'all' ? ids.filter((id) => game(id).timeClass === filterTc) : ids;
+  const ids = [...S.recs.keys()].filter((id) => !S.recs.get(id).bad && meta(id));
+  ids.sort((a, b) => (meta(b).ts || 0) - (meta(a).ts || 0));
+  return filterTc && filterTc !== 'all' ? ids.filter((id) => meta(id).timeClass === filterTc) : ids;
 }
 const opp = (g) => (g.userColor === 'b' ? g.white : g.black);
 const oppElo = (g) => (g.userColor === 'b' ? g.whiteElo : g.blackElo);
@@ -92,12 +131,13 @@ const myElo = (g) => (g.userColor === 'b' ? g.blackElo : g.whiteElo);
 function addPGNs(items, src) { // items: [{pgn, accuracies?}]
   const added = [];
   items.forEach((it) => {
-    const g = Core.parseGame(it.pgn, S.settings.user);
-    if (!g) return;
+    if (!/\d+\.\s*\S/.test(it.pgn.replace(/^\[.*\]\s*$/gm, ''))) return; // no moves
+    const g = Core.parseMeta(it.pgn, S.settings.user);
     const old = S.recs.get(g.id);
     if (old) { if (it.accuracies && !old.ca) { old.ca = it.accuracies; added.push(old); } return; }
-    const rec = { id: g.id, pgn: it.pgn, ts: g.ts, an: null, src, ca: it.accuracies || null };
-    S.recs.set(g.id, rec); S.parsed[g.id] = g; added.push(rec);
+    g.user = S.settings.user.toLowerCase();
+    const rec = { id: g.id, pgn: it.pgn, ts: g.ts, an: null, src, ca: it.accuracies || null, meta: g };
+    S.recs.set(g.id, rec); added.push(rec);
   });
   if (added.length) store.putGames(added).catch(() => toast('Non riesco a salvare le partite su questo dispositivo'));
   return added.filter((r) => !r.an).length;
@@ -123,8 +163,9 @@ async function sync(manual) {
       const isRecent = recent.includes(key);
       if (months[key] && months[key].done && !isRecent) continue;
       const [y, m] = key.split('/');
-      S.syncMsg = 'Scarico ' + new Date(+y, +m - 1, 1).toLocaleDateString('it-IT', { month: 'long', year: 'numeric' }) + '…';
-      renderGames();
+      S.syncMsg = 'Scarico ' + new Date(+y, +m - 1, 1).toLocaleDateString('it-IT', { month: 'long', year: 'numeric' }) + '… (' + S.recs.size + ' partite)';
+      const sm = $('syncMsg'); if (sm) sm.textContent = S.syncMsg; else if (S.view === 'games') renderGames();
+      await new Promise((ok) => setTimeout(ok, 0));
       const list = await CC.month(url);
       newCount += addPGNs(list, 'chesscom');
       months[key] = { done: !isRecent, n: list.length, at: Date.now() };
@@ -137,28 +178,32 @@ async function sync(manual) {
   }
   S.syncing = false; S.syncMsg = '';
   refresh();
-  if (newCount && S.settings.auto) analyzeAll();
+  migrateCompact();
+  if (newCount && S.settings.auto) {
+    if (newCount <= 25) analyzeAll();
+    else toast(newCount + ' partite da analizzare: premi «Analizza» quando vuoi');
+  }
 }
 
 /* ---------------- analysis queue ---------------- */
 let wake = null;
 async function wakeOn() { try { if (navigator.wakeLock) wake = await navigator.wakeLock.request('screen'); } catch (e) { wake = null; } }
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && S.run.on) wakeOn(); });
-function needsAnalysis(id) { const r = S.recs.get(id); return r && (!r.an || r.an.v !== 2) && game(id); }
+function needsAnalysis(id) { const r = S.recs.get(id); return r && !r.bad && (!r.an || r.an.v !== 2); }
 function analyzeAll() { enqueue(sortedIds().filter(needsAnalysis)); }
 function enqueue(ids, front) {
   ids = ids.filter((id) => needsAnalysis(id) && !S.run.queue.includes(id));
   if (!ids.length) { if (!S.run.on) toast('Tutte le partite sono già analizzate'); return; }
-  ids.forEach((id) => { S.run.total += game(id).fens.length; });
+  ids.forEach((id) => { S.run.total += meta(id).plies + 1; });
   S.run.gamesTotal += ids.length;
   S.run.queue = front ? ids.concat(S.run.queue) : S.run.queue.concat(ids);
   if (!S.run.on) startRun();
-  else refresh();
+  else { renderRunBox(); progressTick(true); }
 }
 async function startRun() {
   const R = S.run;
   R.on = true; R.t0 = Date.now(); R.done = 0; R.games = 0; R.label = 'Avvio Stockfish 17…';
-  wakeOn(); refresh();
+  wakeOn(); renderRunBox(); progressTick(true);
   const n = Math.max(1, Math.min(poolSize(), R.queue.length));
   try {
     R.engines = Array.from({ length: n }, () => new Engine());
@@ -169,7 +214,7 @@ async function startRun() {
   }
   const worker = async (eng) => {
     while (R.on && R.queue.length) {
-      const id = R.queue.shift(), g = game(id);
+      const id = R.queue.shift(), g = needsAnalysis(id) ? game(id) : null;
       const opts = DEPTHS[R.override[id] || S.settings.depth] || DEPTHS.normal;
       delete R.override[id];
       if (!g || !needsAnalysis(id)) continue;
@@ -180,19 +225,23 @@ async function startRun() {
         const an = await Core.analyzeGame(g, eng, { depth: opts.depth, movetime: opts.movetime, multipv: 2 }, (i) => {
           R.done += i - base; base = i; progressTick();
         });
+        R.done += Math.max(0, meta(id).plies + 1 - base);
         const rec = S.recs.get(id); rec.an = an; delete S.reviews[id];
+        buildCompact(id);
         await store.putGame(rec).catch(() => {});
         R.games++;
-        progressTick(true);
+        updateRow(id);
+        progressTick();
         if (S.rv.id === id && S.view === 'review') openReview(id, S.rv.ply);
       } catch (e) { if (!R.on) break; }
+      if (S.rv.id !== id) { delete S.parsed[id]; delete S.reviews[id]; }
     }
   };
   await Promise.all(R.engines.map(worker));
   const stopped = !R.on, done = R.games;
   stopRun();
   toast(stopped ? 'Analisi fermata · ' + done + ' salvate' : 'Analisi completata · ' + done + (done === 1 ? ' partita' : ' partite'));
-  refresh();
+  if (S.view === 'games') renderRunBox(); else refresh();
 }
 function stopRun() {
   const R = S.run;
@@ -210,7 +259,7 @@ function progressTick(force) {
   if (R.on) { mp.hidden = false; mp.textContent = 'Analisi ' + Math.min(R.games + 1, R.gamesTotal) + '/' + R.gamesTotal; } else mp.hidden = true;
   const box = $('runBox');
   if (!box) { if (force && S.view === 'games') renderGames(); return; }
-  if (force) { renderGames(); return; }
+  if (force && (!R.on || !box.querySelector('[data-t]'))) { renderRunBox(); }
   const el = (now - R.t0) / 1000, rate = R.done / Math.max(el, 1);
   const bar = box.querySelector('.progress i'); if (bar) bar.style.width = (R.total ? 100 * R.done / R.total : 0).toFixed(1) + '%';
   const t = box.querySelector('[data-t]'); if (t) t.textContent = 'Partita ' + Math.min(R.games + 1, R.gamesTotal) + ' di ' + R.gamesTotal + ' · ' + R.label;
@@ -240,48 +289,64 @@ function renderGames() {
   h += '<div class="card profile" style="margin-top:4px"><div class="avatar" style="' + (p && p.avatar ? 'background-image:url(' + esc(p.avatar) + ')' : '') + '">' + (p && p.avatar ? '' : esc(s.user[0] || '?').toUpperCase()) + '</div>' +
     '<div class="grow"><div style="font-weight:700;font-size:17px">' + esc(p ? p.username : s.user) + '</div>' +
     '<div class="ratings">' + (p ? ['rapid', 'blitz', 'bullet', 'daily'].filter((k) => p.ratings[k]).map((k) => '<span class="rating">' + TC_ICON[k] + p.ratings[k] + '</span>').join('') : '') + '</div>' +
-    '<div class="dim small" style="margin-top:4px">' + (S.syncing ? esc(S.syncMsg) : 'Aggiornato ' + ago(s.lastSync)) + '</div></div>' +
+    '<div class="dim small" style="margin-top:4px" id="syncMsg">' + (S.syncing ? esc(S.syncMsg) : 'Aggiornato ' + ago(s.lastSync)) + '</div></div>' +
     '<button class="icon-btn" id="syncBtn" aria-label="Aggiorna da Chess.com"' + (S.syncing ? ' disabled' : '') + '>' + (S.syncing ? '<span class="spin"></span>' : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 0 0-14.3-4.9L4 8M4 4v4h4M4 13a8 8 0 0 0 14.3 4.9L20 16M20 20v-4h-4"/></svg>') + '</button></div>';
-  // analysis
-  const todo = ids.filter(needsAnalysis).length, R = S.run;
-  h += '<div class="card stack" id="runBox" style="margin-top:12px">';
-  if (R.on) {
-    h += '<div class="row"><span class="spin"></span><b class="grow">Analisi in corso</b><button class="btn sm" id="stopBtn">Ferma</button></div>' +
-      '<div class="progress"><i style="width:' + (R.total ? 100 * R.done / R.total : 0) + '%"></i></div>' +
-      '<div class="row small"><span class="muted grow" data-t>Partita ' + Math.min(R.games + 1, R.gamesTotal) + ' di ' + R.gamesTotal + ' · ' + esc(R.label) + '</span><span class="dim" data-e></span></div>' +
-      '<div class="dim small">Stockfish 17.1 su ' + R.engines.length + (R.engines.length === 1 ? ' processo' : ' processi') + '. Tieni l\'app aperta: lo schermo resta acceso.</div>';
-  } else if (todo) {
-    h += '<div class="row"><div class="grow"><b>' + todo + (todo === 1 ? ' partita da analizzare' : ' partite da analizzare') + '</b><div class="dim small">Stockfish 17.1 · profondità ' + (DEPTHS[s.depth] || DEPTHS.normal).depth + '</div></div></div>' +
-      '<button class="btn primary big" id="anAll">Analizza tutte</button>';
-  } else {
-    h += '<div class="row"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="var(--green)" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5 10 17 19 7"/></svg><div class="grow"><b>Tutte le partite sono analizzate</b><div class="dim small">' + ids.length + ' partite · le nuove vengono analizzate ' + (s.auto ? 'da sole' : 'quando premi Analizza') + '</div></div></div>';
-  }
-  h += '</div>';
+  h += '<div class="card stack" id="runBox" style="margin-top:12px">' + runBoxHtml(ids) + '</div>';
   // filters + list
-  const tcs = ['all', ...new Set(ids.map((id) => game(id).timeClass))];
+  const tcs = ['all', ...new Set(ids.map((id) => meta(id).timeClass))];
   h += '<div class="chips" style="margin-top:16px" id="tcChips">' + tcs.map((k) => '<button aria-pressed="' + (S.tc === k) + '" data-tc="' + k + '">' + TC_NAME[k] + '</button>').join('') + '</div>';
   const list = sortedIds(S.tc);
   if (!list.length) h += '<div class="empty" style="margin-top:12px">Nessuna partita qui. Tocca Aggiorna per scaricare le ultime.</div>';
   let curMonth = '', open = false;
-  list.forEach((id) => {
-    const g = game(id), mk = fmtDate(g.ts, { month: 'long', year: 'numeric' });
+  list.slice(0, S.limit).forEach((id) => {
+    const g = meta(id), mk = fmtDate(g.ts, { month: 'long', year: 'numeric' });
     if (mk !== curMonth) { if (open) h += '</div>'; h += '<div class="month lbl">' + esc(mk) + '</div><div class="glist">'; open = true; curMonth = mk; }
     h += gameRow(id);
   });
   if (open) h += '</div>';
+  if (list.length > S.limit) h += '<button class="btn" id="moreBtn" style="width:100%;margin-top:12px">Mostra altre (' + (list.length - S.limit) + ' rimanenti)</button>';
   v.innerHTML = h + settingsHtml();
   $('syncBtn').onclick = () => sync(true);
-  const ab = $('anAll'); if (ab) ab.onclick = analyzeAll;
-  const sb = $('stopBtn'); if (sb) sb.onclick = () => { S.run.on = false; S.run.engines.forEach((e) => e.kill()); };
-  $('tcChips').onclick = (e) => { const b = e.target.closest('button'); if (b) { S.tc = b.dataset.tc; renderGames(); } };
+  bindRunBox();
+  const mb = $('moreBtn'); if (mb) mb.onclick = () => { S.limit += 60; const y = window.scrollY; renderGames(); window.scrollTo(0, y); };
+  $('tcChips').onclick = (e) => { const b = e.target.closest('button'); if (b) { S.tc = b.dataset.tc; S.limit = 60; renderGames(); } };
   bindSettings();
   progressTick();
 }
+function runBoxHtml(ids) {
+  const todo = ids.filter(needsAnalysis).length, R = S.run, s = S.settings;
+  if (R.on) {
+    return '<div class="row"><span class="spin"></span><b class="grow">Analisi in corso</b><button class="btn sm" id="stopBtn">Ferma</button></div>' +
+      '<div class="progress"><i style="width:' + (R.total ? 100 * R.done / R.total : 0) + '%"></i></div>' +
+      '<div class="row small"><span class="muted grow" data-t>Partita ' + Math.min(R.games + 1, R.gamesTotal) + ' di ' + R.gamesTotal + ' · ' + esc(R.label) + '</span><span class="dim" data-e></span></div>' +
+      '<div class="dim small">Stockfish 17.1 su ' + (R.engines.length || '…') + (R.engines.length === 1 ? ' processo' : ' processi') + '. Tieni l\'app aperta: lo schermo resta acceso.</div>';
+  }
+  if (todo) {
+    const d = DEPTHS[s.depth] || DEPTHS.normal, est = todo * (d.movetime / 1000) * 60 / Math.max(1, poolSize()) / 3;
+    return '<div class="row"><div class="grow"><b>' + todo + (todo === 1 ? ' partita da analizzare' : ' partite da analizzare') + '</b><div class="dim small">Stockfish 17.1 · profondità ' + d.depth + ' · circa ' + fmtDur(est) + '</div></div></div>' +
+      (todo > 50 ? '<div class="row"><button class="btn primary grow" id="anSome">Le ultime 50</button><button class="btn grow" id="anAll">Tutte</button></div>' : '<button class="btn primary big" id="anAll">Analizza tutte</button>');
+  }
+  return '<div class="row"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="var(--green)" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5 10 17 19 7"/></svg><div class="grow"><b>Tutte le partite sono analizzate</b><div class="dim small">' + ids.length + ' partite · le nuove vengono analizzate ' + (s.auto ? 'da sole' : 'quando premi Analizza') + '</div></div></div>';
+}
+function bindRunBox() {
+  const ab = $('anAll'); if (ab) ab.onclick = analyzeAll;
+  const as = $('anSome'); if (as) as.onclick = () => enqueue(sortedIds().filter(needsAnalysis).slice(0, 50));
+  const sb = $('stopBtn'); if (sb) sb.onclick = () => { S.run.on = false; S.run.engines.forEach((e) => e.kill()); };
+}
+function renderRunBox() {
+  const box = $('runBox'); if (!box) return;
+  box.innerHTML = runBoxHtml(sortedIds()); bindRunBox();
+}
+function updateRow(id) {
+  const el = document.querySelector('.gi[data-id="' + id + '"]:not([data-ply])');
+  if (el) el.outerHTML = gameRow(id);
+}
 function gameRow(id) {
-  const g = game(id), rv = reviewOf(id), oc = g.outcome || 'none';
+  const g = meta(id), r = S.recs.get(id), oc = g.outcome || 'none';
   const letter = { win: '+', loss: '−', draw: '=', none: '?' }[oc];
   let acc = '';
-  if (rv) { const sm = Core.gameSummary(g, rv); acc = '<b class="num">' + fmt1(sm.userAcc) + '</b><div class="dim num">' + fmt1(sm.oppAcc) + '</div>'; }
+  if (r.sum && r.an) acc = '<b class="num">' + fmt1(r.sum.userAcc) + '</b><div class="dim num">' + fmt1(r.sum.oppAcc) + '</div>';
+  else if (r.an && r.an.v === 2) acc = '<span class="pill">analizzata</span>';
   else acc = '<span class="pill">' + (S.run.queue.includes(id) ? 'in coda' : 'nuova') + '</span>';
   const me = g.userColor || 'w', them = me === 'w' ? 'b' : 'w';
   return '<div class="gi" tabindex="0" role="button" data-id="' + esc(id) + '">' +
@@ -320,7 +385,7 @@ function bindSettings() {
   on('bkIn', 'change', async (e) => { const f = e.target.files[0]; if (f) importBackup(await f.text()); e.target.value = ''; });
   on('reAn', 'click', () => {
     if (!confirm('Rianalizzare tutte le partite con le impostazioni attuali?')) return;
-    const list = [...S.recs.values()]; list.forEach((r) => { r.an = null; }); S.reviews = {};
+    const list = [...S.recs.values()]; list.forEach((r) => { r.an = null; r.rv = null; r.sum = null; }); S.reviews = {};
     store.putGames(list).then(analyzeAll);
   });
 }
@@ -526,7 +591,7 @@ function renderSummary() {
   h += '<div class="card small muted"><div><b style="color:var(--text)">' + esc(g.opening) + '</b>' + (g.eco ? ' · ' + esc(g.eco) : '') + '</div><div style="margin-top:4px">' + esc(resultText(g)) + ' · analisi a profondità ' + rec.an.depth + '</div>' +
     '<div class="row" style="margin-top:10px">' + (g.link ? '<a class="btn sm" href="' + esc(g.link) + '" target="_blank" rel="noopener">Apri su Chess.com</a>' : '') + '<button class="btn sm ghost" id="reOne">Rianalizza più a fondo</button></div></div>';
   box.innerHTML = h;
-  $('reOne').onclick = () => { const r = S.recs.get(id); r.an = null; delete S.reviews[id]; S.run.override[id] = 'deep'; enqueue([id], true); renderSummary(); renderMoves(); drawReview(false); };
+  $('reOne').onclick = () => { const r = S.recs.get(id); r.an = null; r.rv = null; r.sum = null; delete S.reviews[id]; S.run.override[id] = 'deep'; enqueue([id], true); renderSummary(); renderMoves(); drawReview(false); };
 }
 function go(delta, abs) {
   if (!S.rv.id) return;
@@ -573,16 +638,17 @@ function stopLive() { if (liveEngine) liveEngine.stop(); }
 
 /* ---------------- view: stats ---------------- */
 function statsEntries() {
-  return sortedIds().map((id) => ({ game: game(id), rv: reviewOf(id) })).filter((e) => e.game.userColor &&
+  return sortedIds().map((id) => ({ game: meta(id), rv: crev(id) })).filter((e) => e.game.userColor &&
     (S.stats.tc === 'all' || e.game.timeClass === S.stats.tc) && (S.stats.color === 'all' || e.game.userColor === S.stats.color));
 }
 function renderStats() {
   const v = $('v-stats'), ids = sortedIds();
   if (!ids.length) { v.innerHTML = '<h1>Statistiche</h1><div class="empty">Carica le tue partite da Chess.com per vedere le statistiche.</div>'; return; }
-  const tcs = ['all', ...new Set(ids.map((id) => game(id).timeClass))];
+  const tcs = ['all', ...new Set(ids.map((id) => meta(id).timeClass))];
   let h = '<h1>Statistiche</h1><div class="stack" style="gap:8px"><div class="chips" id="stTc">' + tcs.map((k) => '<button aria-pressed="' + (S.stats.tc === k) + '" data-v="' + k + '">' + TC_NAME[k] + '</button>').join('') + '</div>' +
     '<div class="chips" id="stCol">' + [['all', 'Tutti i colori'], ['w', 'Col bianco'], ['b', 'Col nero']].map(([k, l]) => '<button aria-pressed="' + (S.stats.color === k) + '" data-v="' + k + '">' + l + '</button>').join('') + '</div></div>';
   const A = Core.aggregate(statsEntries());
+  if (migrating) h += '<p class="dim small">Sto preparando le statistiche delle partite già analizzate…</p>';
   if (!A.games) { v.innerHTML = h + '<div class="empty" style="margin-top:14px">Nessuna partita con questi filtri.</div>'; bindStats(); return; }
   const R = A.results, tot = R.win + R.draw + R.loss;
   let moves = 0; for (const c in A.cls) if (c !== 'book') moves += A.cls[c];
@@ -637,7 +703,7 @@ function renderStats() {
   if (A.worst.length) {
     h += '<h2>Blunder da rivedere</h2><div class="glist">';
     A.worst.forEach((w) => {
-      const g = game(w.id), mn = Math.floor(w.i / 2) + 1 + (w.i % 2 ? '…' : '.');
+      const g = meta(w.id), mn = Math.floor(w.i / 2) + 1 + (w.i % 2 ? '…' : '.');
       h += '<div class="gi" tabindex="0" role="button" data-id="' + esc(w.id) + '" data-ply="' + (w.i + 1) + '"><span>' + ci('blunder') + '</span><div class="pl"><span class="me num">' + mn + ' ' + esc(w.san) + '</span><span class="muted">contro ' + esc(opp(g)) + ' · ' + esc(fmtDate(g.ts)) + '</span></div><div class="acc"><b class="num">−' + w.loss.toFixed(0) + '%</b><div class="dim">vittoria</div></div><span></span></div>';
     });
     h += '</div>';
@@ -717,7 +783,7 @@ function lineChart(vals, o) {
 /* ---------------- view: puzzle ---------------- */
 function buildPuzzles() {
   const list = [];
-  sortedIds().forEach((id) => { const rv = reviewOf(id); if (rv) list.push(...Core.puzzlesFrom(game(id), rv)); });
+  sortedIds().forEach((id) => { const rv = crev(id); if (rv) list.push(...Core.puzzlesFrom(meta(id), rv)); });
   S.pz.all = list;
 }
 function pzList() {
@@ -756,7 +822,7 @@ function pzSetMovable() {
   pzBoard.setMovable(S.pz.state === 'play' ? d : null);
 }
 function pzSide(msg) {
-  const p = curPuzzle(), g = game(p.gameId), turn = p.fen.split(' ')[1], st = S.pz.state;
+  const p = curPuzzle(), g = meta(p.gameId), turn = p.fen.split(' ')[1], st = S.pz.state;
   const l = pzList(), mvNo = Math.floor(p.ply / 2) + 1;
   let head = '';
   if (st === 'ok') head = '<div class="pz-status ok"><svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5 10 17 19 7"/></svg><div><b>Risolto!</b><div class="small">' + (msg || 'Era la mossa migliore.') + '</div></div></div>';
@@ -841,6 +907,7 @@ async function boot() {
     (await store.allGames()).forEach((r) => S.recs.set(r.id, r));
   } catch (e) { toast('Archivio locale non disponibile: le partite non verranno salvate'); }
   store.persist();
+  setTimeout(migrateCompact, 1500);
   document.querySelectorAll('.nav button').forEach((b) => { b.onclick = () => show(b.dataset.view); });
   document.addEventListener('click', (e) => {
     const gi = e.target.closest('.gi[data-id]');

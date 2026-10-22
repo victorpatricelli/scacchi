@@ -1,5 +1,5 @@
 // Offline cache for the app shell and the engine. Chess.com API calls always go to the network.
-const VERSION = 'v1';
+const VERSION = 'v2';
 const SHELL = [
   './', 'index.html', 'css/app.css', 'manifest.webmanifest',
   'js/app.js', 'js/board.js', 'js/engine.js', 'js/store.js', 'js/chesscom.js', 'js/core.js', 'js/chess.js',
@@ -27,7 +27,11 @@ self.addEventListener('fetch', (e) => {
   e.respondWith(caches.open(VERSION).then(async (c) => {
     const hit = await c.match(e.request, { ignoreSearch: true });
     if (hit && isEngine) return hit;
-    const net = fetch(e.request).then((res) => { if (res.ok) c.put(e.request, res.clone()); return res; }).catch(() => hit);
-    return hit ? (e.waitUntil(net), hit) : net; // stale-while-revalidate
+    // network first (so updates arrive at once), cache when offline
+    try {
+      const res = await fetch(e.request, { cache: 'no-cache' });
+      if (res.ok) c.put(e.request, res.clone());
+      return res;
+    } catch (err) { return hit || Response.error(); }
   }));
 });
