@@ -2,6 +2,7 @@ import { Board } from './board.js';
 import { Engine, DEPTHS, poolSize } from './engine.js';
 import { store } from './store.js';
 import * as CC from './chesscom.js';
+import * as LI from './lichess.js';
 import { createPlay } from './play.js';
 
 const $ = (id) => document.getElementById(id);
@@ -24,15 +25,18 @@ const TC_ICON = {
 TC_ICON.all = TC_ICON.rapid;
 
 const S = {
-  settings: { user: 'Victor1186', depth: 'normal', auto: true, sound: true, range: '6', lastSync: 0, synced: false },
+  settings: { user: 'Victor1186', lichess: '', depth: 'normal', auto: true, sound: true, range: '6', lastSync: 0, synced: false, live: true },
   profile: null, recs: new Map(), parsed: {}, reviews: {},
   view: 'games', tc: 'all', stats: { tc: 'all', color: 'all' },
-  rv: { id: null, ply: 0, flip: false, tab: 'moves', explore: null },
+  rv: { id: null, ply: 0, flip: false, tab: 'moves', explore: null, live: null },
+  liveCache: {},
   pz: { list: [], idx: 0, filter: 'todo', step: 0, state: 'idle', progress: {} },
   run: { on: false, engines: [], queue: [], override: {}, done: 0, total: 0, games: 0, gamesTotal: 0, t0: 0, label: '' },
   syncing: false, syncMsg: '', limit: 60
 };
 let rvBoard = null, pzBoard = null, liveEngine = null, play = null;
+// all the user's names (Chess.com + Lichess), lower case, joined with |
+const userKey = () => [S.settings.user, S.settings.lichess].map((x) => String(x || '').trim().toLowerCase()).filter(Boolean).join('|');
 
 /* ---------------- utilities ---------------- */
 function toast(t) { const el = $('toast'); el.textContent = t; el.hidden = false; clearTimeout(toast.t); toast.t = setTimeout(() => { el.hidden = true; }, 3400); }
@@ -71,7 +75,7 @@ const LRU = [];
 function game(id) {
   if (!S.parsed[id]) {
     const r = S.recs.get(id); if (!r) return null;
-    const g = Core.parseGame(r.pgn, S.settings.user);
+    const g = Core.parseGame(r.pgn, userKey());
     if (!g) { r.bad = true; return null; }
     g.id = id; S.parsed[id] = g; LRU.push(id);
     if (r.meta && g.opening !== r.meta.opening) { r.meta.opening = g.opening; r.meta.openingFamily = g.openingFamily; r.meta.eco = g.eco; }
@@ -82,8 +86,8 @@ function game(id) {
 // Header metadata: cheap, used everywhere else.
 function meta(id) {
   const r = S.recs.get(id); if (!r) return null;
-  if (!r.meta || r.meta.user !== S.settings.user.toLowerCase()) {
-    r.meta = Core.parseMeta(r.pgn, S.settings.user); r.meta.user = S.settings.user.toLowerCase(); r.meta.id = id;
+  if (!r.meta || r.meta.user !== userKey()) {
+    r.meta = Core.parseMeta(r.pgn, userKey()); r.meta.user = userKey(); r.meta.id = id;
   }
   return r.meta;
 }
@@ -96,13 +100,13 @@ function reviewOf(id) { // full review of the open game
 function crev(id) { // compact stored review, for lists, stats and puzzles
   const r = S.recs.get(id);
   if (!r || !r.an || r.an.v !== 2) return null;
-  if (!r.rv || r.rvUser !== S.settings.user.toLowerCase()) return null;
+  if (!r.rv || r.rvUser !== userKey()) return null;
   return r.rv;
 }
 function buildCompact(id) {
   const r = S.recs.get(id), g = game(id), rv = reviewOf(id);
   if (!g || !rv) return null;
-  r.rv = Core.compactReview(g, rv); r.rvUser = S.settings.user.toLowerCase();
+  r.rv = Core.compactReview(g, rv); r.rvUser = userKey();
   r.sum = Core.gameSummary(g, rv);
   return r.rv;
 }
@@ -133,10 +137,10 @@ function addPGNs(items, src) { // items: [{pgn, accuracies?}]
   const added = [];
   items.forEach((it) => {
     if (!/\d+\.\s*\S/.test(it.pgn.replace(/^\[.*\]\s*$/gm, ''))) return; // no moves
-    const g = Core.parseMeta(it.pgn, S.settings.user);
+    const g = Core.parseMeta(it.pgn, userKey());
     const old = S.recs.get(g.id);
     if (old) { if (it.accuracies && !old.ca) { old.ca = it.accuracies; added.push(old); } return; }
-    g.user = S.settings.user.toLowerCase();
+    g.user = userKey();
     const rec = { id: g.id, pgn: it.pgn, ts: g.ts, an: null, src, ca: it.accuracies || null, meta: g };
     S.recs.set(g.id, rec); added.push(rec);
   });
@@ -172,6 +176,7 @@ async function sync(manual) {
       months[key] = { done: !isRecent, n: list.length, at: Date.now() };
       await store.set('months:' + user.toLowerCase(), months);
     }
+    newCount += await syncLichess();
     S.settings.lastSync = Date.now(); S.settings.synced = true; saveSettings();
     if (manual || newCount) toast(newCount ? newCount + (newCount === 1 ? ' partita nuova' : ' partite nuove') : 'Nessuna partita nuova');
   } catch (e) {
@@ -184,6 +189,24 @@ async function sync(manual) {
     if (newCount <= 25) analyzeAll();
     else toast(newCount + ' partite da analizzare: premi «Analizza» quando vuoi');
   }
+}
+
+async function syncLichess() {
+  const lu = (S.settings.lichess || '').trim();
+  if (!lu) return 0;
+  const key = 'lichess:' + lu.toLowerCase();
+  try {
+    const st = (await store.get(key)) || { last: 0 };
+    let since = st.last;
+    if (!since && S.settings.range !== 'all') { const d = new Date(); d.setMonth(d.getMonth() - (+S.settings.range || 6)); since = d.getTime(); }
+    S.syncMsg = 'Scarico le partite di Lichess…'; const sm = $('syncMsg'); if (sm) sm.textContent = S.syncMsg;
+    const pgns = await LI.games(lu, { since, max: S.settings.range === 'all' ? 2000 : 600, onProgress: (n) => { const el = $('syncMsg'); if (el) el.textContent = 'Lichess: ' + n + ' partite…'; } });
+    const n = addPGNs(pgns.map((pgn) => ({ pgn })), 'lichess');
+    let last = st.last;
+    pgns.forEach((p) => { const m = Core.parseMeta(p, ''); if (m.ts > last) last = m.ts; });
+    await store.set(key, { last });
+    return n;
+  } catch (e) { toast(e.message || 'Lichess non raggiungibile'); return 0; }
 }
 
 /* ---------------- analysis queue ---------------- */
@@ -352,7 +375,7 @@ function gameRow(id) {
   const me = g.userColor || 'w', them = me === 'w' ? 'b' : 'w';
   return '<div class="gi" tabindex="0" role="button" data-id="' + esc(id) + '">' +
     '<span class="tc" title="' + esc(TC_NAME[g.timeClass]) + '">' + TC_ICON[g.timeClass] + '</span>' +
-    '<div class="pl"><span class="me"><i class="sqc ' + me + '"></i>' + esc(S.settings.user) + ' <span class="dim num">' + (myElo(g) || '') + '</span></span>' +
+    '<div class="pl"><span class="me"><i class="sqc ' + me + '"></i>' + esc(g.userColor === 'b' ? g.black : g.userColor === 'w' ? g.white : S.settings.user) + (id[0] === 'l' ? ' <span class="pill" style="font-size:10px;padding:1px 5px">lichess</span>' : '') + ' <span class="dim num">' + (myElo(g) || '') + '</span></span>' +
     '<span class="muted"><i class="sqc ' + them + '"></i>' + esc(opp(g)) + ' <span class="dim num">' + (oppElo(g) || '') + '</span></span></div>' +
     '<div class="acc">' + acc + '</div><div class="res ' + oc + '">' + letter + '</div></div>';
 }
@@ -364,6 +387,7 @@ function settingsHtml() {
   const s = S.settings;
   return '<details class="more card flat" style="margin-top:18px"><summary>Impostazioni e importazione</summary><div class="stack" style="margin-top:10px">' +
     '<div class="grid2"><div class="stack"><label class="lbl" for="sUser">Utente Chess.com</label><input type="text" id="sUser" value="' + esc(s.user) + '" autocapitalize="off" spellcheck="false"></div>' +
+    '<div class="stack"><label class="lbl" for="sLichess">Utente Lichess (facoltativo)</label><input type="text" id="sLichess" value="' + esc(s.lichess || '') + '" placeholder="lascia vuoto se non giochi su Lichess" autocapitalize="off" spellcheck="false"></div>' +
     '<div class="stack"><label class="lbl" for="sRange">Partite da scaricare</label><select id="sRange">' + rangeOpts() + '</select></div>' +
     '<div class="stack"><label class="lbl" for="sDepth">Profondità di analisi</label><select id="sDepth">' + Object.entries(DEPTHS).map(([k, d]) => '<option value="' + k + '"' + (s.depth === k ? ' selected' : '') + '>' + d.label + ' · profondità ' + d.depth + '</option>').join('') + '</select></div>' +
     '<div class="stack"><span class="lbl">Opzioni</span><label class="row small"><input type="checkbox" id="sAuto"' + (s.auto ? ' checked' : '') + '> Analizza da sola le partite nuove</label><label class="row small"><input type="checkbox" id="sSound"' + (s.sound ? ' checked' : '') + '> Suoni delle mosse</label></div></div>' +
@@ -376,6 +400,7 @@ function settingsHtml() {
 function bindSettings() {
   const s = S.settings, on = (id, ev, fn) => { const el = $(id); if (el) el.addEventListener(ev, fn); };
   on('sUser', 'change', (e) => { const v = e.target.value.trim(); if (!v || v === s.user) return; s.user = v; s.synced = false; s.lastSync = 0; S.profile = null; S.parsed = {}; S.reviews = {}; saveSettings(); sync(true); });
+  on('sLichess', 'change', (e) => { s.lichess = e.target.value.trim(); S.parsed = {}; S.reviews = {}; saveSettings(); sync(true); });
   on('sRange', 'change', (e) => { s.range = e.target.value; saveSettings(); sync(true); });
   on('sDepth', 'change', (e) => { s.depth = e.target.value; saveSettings(); });
   on('sAuto', 'change', (e) => { s.auto = e.target.checked; saveSettings(); });
@@ -391,7 +416,7 @@ function bindSettings() {
   });
 }
 function analyzeBotGame(text) {
-  const g = Core.parseMeta(text, S.settings.user);
+  const g = Core.parseMeta(text, userKey());
   if (!S.recs.has(g.id)) addPGNs([{ pgn: text }], 'bot');
   const rec = S.recs.get(g.id);
   if (rec && !rec.an) enqueue([g.id], true);
@@ -434,7 +459,7 @@ function openReview(id, ply) {
     rvBoard = new Board($('rvBoard'), { onMove: exploreMove });
   }
   rvBoard.setOrientation(S.rv.flip ? 'b' : 'w');
-  renderMoves(); renderSummary(); drawReview(false);
+  renderMoves(); renderSummary(); drawReview(false); liveThink();
 }
 function playerBar(el, color, g, ply) {
   const name = color === 'w' ? g.white : g.black, elo = color === 'w' ? g.whiteElo : g.blackElo;
@@ -470,6 +495,8 @@ function drawReview(animate = true) {
     }
   }
   if (ex && ex.lines && ex.lines[0] && ex.lines[0].pv[0]) { const u = ex.lines[0].pv[0]; arrows = [{ from: u.slice(0, 2), to: u.slice(2, 4), color: '#81b64ce6' }]; }
+  const L = !ex && liveFor(id, ply);
+  if (L && L.lines[0] && L.lines[0].pv[0]) { const u = L.lines[0].pv[0]; arrows.push({ from: u.slice(0, 2), to: u.slice(2, 4), color: '#4a90d9d9' }); }
   let check = null;
   if (ch.in_check()) { const b = Core.board(fen), turn = fen.split(' ')[1]; for (const s in b) if (b[s].t === 'k' && b[s].c === turn) check = s; }
   rvBoard.set(fen, { lastMove, mark, arrows, check, animate });
@@ -480,6 +507,7 @@ function drawReview(animate = true) {
   // eval bar
   let ev = null;
   if (ex && ex.lines && ex.lines[0]) { const l = ex.lines[0], s = fen.split(' ')[1] === 'w' ? 1 : -1; ev = l.mate != null ? { mate: l.mate * s } : { cp: l.cp * s }; }
+  else if (L && L.ev) ev = L.ev;
   else if (!ex && an && an.v === 2) ev = Core.unpackEv(an.ev[ply]);
   const wp = ev ? Core.winPct(ev) : 50;
   $('evalbar').classList.toggle('flip', S.rv.flip);
@@ -497,6 +525,38 @@ function drawReview(animate = true) {
   });
   drawGraph(g, an, rv, ply);
   $('cExplore').classList.toggle('on', !!ex);
+  $('cLive').classList.toggle('live-on', !!S.settings.live);
+  $('cLive').setAttribute('aria-pressed', String(!!S.settings.live));
+}
+function liveBoxHtml(g, ply) {
+  if (!S.settings.live || S.rv.explore) return '';
+  const L = liveFor(g.id, ply), fen = g.fens[ply];
+  if (new Chess(fen).game_over()) return '';
+  let h = '<div class="livebox"><div class="lh"><span class="dotl' + (L && L.final ? ' done' : '') + '"></span>Stockfish live' + (L && L.depth ? ' · profondità ' + L.depth : ' · sto pensando…') + '</div><div class="lines">';
+  const s = fen.split(' ')[1] === 'w' ? 1 : -1;
+  for (let k = 0; k < 3; k++) {
+    const l = L && L.lines[k];
+    if (!l || !l.pv || !l.pv.length) { h += '<div class="line" style="opacity:.35"><span class="e num">…</span><span class="p"></span></div>'; continue; }
+    const e = l.mate != null ? { mate: l.mate * s } : { cp: l.cp * s };
+    h += '<div class="line" data-u="' + esc(l.pv[0]) + '"><span class="e num' + (Core.winPct(e) >= 50 ? ' w' : '') + '">' + Core.evalText(e) + '</span><span class="p">' + esc(Core.pvSan(fen, l.pv, 8).join(' ')) + '</span></div>';
+  }
+  return h + '</div></div>';
+}
+function bindLiveBox(box) {
+  box.querySelectorAll('.livebox .line[data-u]').forEach((el) => { el.onclick = () => { const u = el.dataset.u; toggleExplore(true); exploreMove(u.slice(0, 2), u.slice(2, 4), u[4]); }; });
+}
+// Provisional judgement of move ply-1 from the live engine (games not analysed yet)
+function liveJudge(g, ply) {
+  const A = liveFor(g.id, ply - 1), B = liveFor(g.id, ply);
+  if (!A || !B || !A.ev || !B.ev || A.depth < 10 || B.depth < 10) return null;
+  const mv = g.moves[ply - 1], side = mv.color;
+  const wb = Core.winPct(A.ev), wa = Core.winPct(B.ev);
+  const before = side === 'w' ? wb : 100 - wb, after = side === 'w' ? wa : 100 - wa;
+  const best = (A.lines[0] && A.lines[0].pv[0]) || '';
+  const isBest = best && best.slice(0, 4) === mv.uci.slice(0, 4);
+  const loss = isBest ? 0 : Math.max(0, before - after);
+  let cls = ply - 1 <= g.bookUntil ? 'book' : loss < 1 ? 'best' : loss < 2 ? 'excellent' : loss < 5 ? 'good' : loss < 10 ? 'inaccuracy' : loss < 20 ? 'mistake' : 'blunder';
+  return { cls, loss, before, after, best };
 }
 function renderCoach(g, rv, an, ply, ev) {
   const box = $('coach'), ex = S.rv.explore;
@@ -520,14 +580,27 @@ function renderCoach(g, rv, an, ply, ev) {
   }
   if (ply === 0) {
     box.innerHTML = '<div class="bubble"><div class="head"><span class="hd">' + esc(g.opening) + '</span>' + evBadge + '</div><p>' + esc(fmtDate(g.ts, { day: 'numeric', month: 'long', year: 'numeric' })) + ' · ' + esc(TC_NAME[g.timeClass]) + (g.timeControl ? ' ' + esc(tcLabel(g.timeControl)) : '') + ' · ' + esc(resultText(g)) + '</p>' +
-      (rv ? '<p>Premi ▶ o scorri le mosse per vedere la revisione.</p>' : '<p>Questa partita non è ancora analizzata.</p><div class="row" style="margin-top:8px"><button class="btn primary sm" id="anOne">' + (S.run.queue.includes(g.id) ? 'In coda…' : 'Analizza ora') + '</button></div>') + '</div>';
+      (rv ? '<p>Premi ▶ o scorri le mosse per vedere la revisione.</p>' : '<p>Questa partita non è ancora analizzata.' + (S.settings.live ? ' Con il motore live vedi comunque il giudizio mossa per mossa.' : '') + '</p><div class="row" style="margin-top:8px"><button class="btn primary sm" id="anOne">' + (S.run.queue.includes(g.id) ? 'In coda…' : 'Analizza ora') + '</button></div>') + liveBoxHtml(g, ply) + '</div>';
+    bindLiveBox(box);
     const b = $('anOne'); if (b) b.onclick = () => { enqueue([g.id], true); b.textContent = 'In coda…'; b.disabled = true; };
     return;
   }
   const mv = g.moves[ply - 1], num = Math.ceil(ply / 2) + (mv.color === 'w' ? '.' : '…');
   const m = rv && rv[ply - 1];
   if (!m) {
-    box.innerHTML = '<div class="bubble"><div class="head num">' + num + ' ' + esc(mv.san) + '</div><p>Analizza la partita per vedere il giudizio su questa mossa.</p><div class="row" style="margin-top:8px"><button class="btn primary sm" id="anOne">' + (S.run.queue.includes(g.id) ? 'In coda…' : 'Analizza ora') + '</button></div></div>';
+    const J = S.settings.live ? liveJudge(g, ply) : null;
+    let h = '';
+    if (J) {
+      const ls = [];
+      if (J.cls === 'book') ls.push('Mossa di teoria: ' + esc(g.opening) + '.');
+      else if (J.best && !['best', 'excellent'].includes(J.cls)) ls.push('La migliore era <b class="num">' + esc(Core.sanOf(g.fens[ply - 1], J.best)) + '</b>.');
+      if (J.loss >= 2 && J.cls !== 'book') ls.push('<span class="dim">Probabilità di vittoria: ' + J.before.toFixed(0) + '% → ' + J.after.toFixed(0) + '%</span>');
+      h = ci(J.cls) + '<div class="bubble"><div class="head"><span class="hd"><span class="num">' + num + ' ' + esc(mv.san) + '</span> <span class="ct c-' + J.cls + '">' + PHRASE[J.cls] + '</span><span class="tag-live">live</span></span>' + evBadge + '</div>' + (ls.length ? '<p>' + ls.join('<br>') + '</p>' : '');
+    } else {
+      h = '<div class="bubble"><div class="head"><span class="hd num">' + num + ' ' + esc(mv.san) + '</span>' + evBadge + '</div><p>' + (S.settings.live ? 'Il giudizio arriva tra un attimo dal motore live.' : 'Accendi il motore live (⚡) o analizza la partita per il giudizio.') + '</p>';
+    }
+    h += '<div class="row" style="margin-top:8px"><button class="btn sm" id="anOne">' + (S.run.queue.includes(g.id) ? 'In coda…' : 'Analisi completa') + '</button></div>' + liveBoxHtml(g, ply) + '</div>';
+    box.innerHTML = h; bindLiveBox(box);
     const b = $('anOne'); if (b) b.onclick = () => { enqueue([g.id], true); b.textContent = 'In coda…'; b.disabled = true; };
     return;
   }
@@ -549,7 +622,8 @@ function renderCoach(g, rv, an, ply, ev) {
   else if (m.spent != null) lines.push('<span class="dim">Pensata ' + m.spent.toFixed(1) + ' s</span>');
   box.innerHTML = ci(m.cls) + '<div class="bubble"><div class="head"><span class="hd"><span class="num">' + num + ' ' + esc(mv.san) + '</span> <span class="ct c-' + m.cls + '">' + PHRASE[m.cls] + '</span></span>' + evBadge + '</div>' +
     (lines.length ? '<p>' + lines.join('<br>') + '</p>' : '') +
-    (m.best && !['best', 'great', 'brilliant', 'book'].includes(m.cls) ? '<div class="row" style="margin-top:8px"><button class="btn sm" id="tryBest">Prova la migliore</button></div>' : '') + '</div>';
+    (m.best && !['best', 'great', 'brilliant', 'book'].includes(m.cls) ? '<div class="row" style="margin-top:8px"><button class="btn sm" id="tryBest">Prova la migliore</button></div>' : '') + liveBoxHtml(g, ply) + '</div>';
+  bindLiveBox(box);
   const tb = $('tryBest');
   if (tb) tb.onclick = () => { S.rv.ply = ply - 1; toggleExplore(true); exploreMove(m.best.slice(0, 2), m.best.slice(2, 4), m.best[4]); };
 }
@@ -611,6 +685,7 @@ function go(delta, abs) {
   S.rv.ply = p;
   if (forward) sound(g.moves[p - 1].captured ? 'capture' : 'move');
   drawReview(Math.abs(delta) === 1 || forward);
+  liveThink();
 }
 /* explorer */
 function toggleExplore(on) {
@@ -619,7 +694,7 @@ function toggleExplore(on) {
     const fen = game(S.rv.id).fens[S.rv.ply];
     S.rv.explore = { fens: [fen], moves: [], sans: [], lines: [], depth: 0 };
     drawReview(false); think();
-  } else { S.rv.explore = null; stopLive(); drawReview(false); }
+  } else { S.rv.explore = null; stopLive(); drawReview(false); liveThink(); }
 }
 function exploreMove(from, to, promo) {
   const ex = S.rv.explore; if (!ex) return;
@@ -643,7 +718,59 @@ function think() {
     drawReview(false);
   }, { multipv: 3, depth: 24 }).catch(() => toast('Il motore non si è avviato'));
 }
-function stopLive() { if (liveEngine) liveEngine.stop(); }
+function stopLive() { liveTok++; if (liveEngine) liveEngine.stop(); }
+/* live mode: Stockfish follows the game move by move */
+let liveTok = 0, liveT = 0;
+function liveFor(id, ply) { const c = S.liveCache[id]; return c ? c[ply] : null; }
+function liveStore(id, ply, fen, lines, depth, final) {
+  const c = S.liveCache[id] || (S.liveCache[id] = {});
+  const old = c[ply];
+  if (old && old.final && old.depth >= depth) return old;
+  const l = lines[0], s = fen.split(' ')[1] === 'w' ? 1 : -1;
+  const ev = l ? (l.mate != null ? { mate: l.mate * s } : { cp: l.cp * s }) : null;
+  c[ply] = { lines: lines.filter(Boolean), depth, ev, final: !!final };
+  return c[ply];
+}
+async function liveThink() {
+  if (!S.settings.live || S.rv.explore || S.view !== 'review' || !S.rv.id) return;
+  const id = S.rv.id, g = game(id), ply = S.rv.ply, tok = ++liveTok;
+  if (!g) return;
+  if (!liveEngine) liveEngine = new Engine();
+  const fen = g.fens[ply], ch = new Chess(fen);
+  try {
+    // to judge the move just played we also need the position before it
+    const reviewed = !!reviewOf(id);
+    if (!reviewed && ply > 0) {
+      const P = liveFor(id, ply - 1);
+      if (!P || P.depth < 12) {
+        const pf = g.fens[ply - 1];
+        if (!new Chess(pf).game_over()) {
+          const r = await liveEngine.analyze(pf, { depth: 14, movetime: 900, multipv: 3 });
+          if (tok !== liveTok) return;
+          liveStore(id, ply - 1, pf, r.lines, 14, true);
+        }
+      }
+    }
+    if (ch.game_over()) { drawReview(false); return; }
+    const have = liveFor(id, ply);
+    if (have && have.final && have.depth >= 22) { drawReview(false); return; }
+    await liveEngine.think(fen, (lines, depth) => {
+      if (tok !== liveTok) return;
+      if (depth < 6) return;
+      liveStore(id, ply, fen, lines, depth, depth >= 22);
+      const now = Date.now();
+      if (now - liveT < 300 && depth < 22) return;
+      liveT = now;
+      if (S.rv.id === id && S.rv.ply === ply && !S.rv.explore) drawReview(false);
+    }, { multipv: 3, depth: 22 });
+  } catch (e) { if (tok === liveTok) toast('Il motore live non si è avviato'); }
+}
+function toggleLive() {
+  S.settings.live = !S.settings.live; saveSettings();
+  if (S.settings.live) { toast('Motore live acceso: Stockfish valuta ogni posizione'); liveThink(); }
+  else { stopLive(); toast('Motore live spento'); }
+  drawReview(false);
+}
 
 /* ---------------- view: stats ---------------- */
 function statsEntries() {
@@ -669,6 +796,7 @@ function renderStats() {
     kpi('Blunder / 100 mosse', moves ? per100(A.cls.blunder, moves).toFixed(1) : '–', moves ? per100(A.cls.mistake + A.cls.miss, moves).toFixed(1) + ' errori' : '') + '</div>';
   if (tot) h += '<div class="wdl"><i style="width:' + 100 * R.win / tot + '%;background:var(--win)"></i><i style="width:' + 100 * R.draw / tot + '%;background:var(--draw)"></i><i style="width:' + 100 * R.loss / tot + '%;background:var(--loss)"></i></div>';
   if (!A.analyzed) { v.innerHTML = h + '<div class="empty" style="margin-top:16px">Pezzi, fasi e tattiche compaiono dopo l\'analisi. Vai su Partite e premi «Analizza tutte».</div>' + openingsHtml(A); bindStats(); return; }
+  h += storyHtml(A);
   h += '<h2>Cosa emerge</h2><div class="card">' + insights(A) + '</div>';
   h += '<h2>Andamento</h2><div class="grid2"><div class="card chart"><h3>Precisione per partita</h3>' + lineChart(accs, { min: 0, max: 100, rolling: 5 }) + '<div class="row dim small" style="margin-top:6px"><span><i class="sqc" style="display:inline-block;background:var(--text-3);border-radius:50%"></i> partita</span><span><i class="sqc" style="display:inline-block;background:var(--green);border-radius:50%"></i> media su 5</span></div></div>';
   const rk = S.stats.tc !== 'all' ? S.stats.tc : Object.keys(A.ratings).sort((a, b) => A.ratings[b].length - A.ratings[a].length)[0];
@@ -718,6 +846,69 @@ function renderStats() {
     h += '</div>';
   }
   v.innerHTML = h; bindStats();
+}
+/* ---- "La tua storia": legend, score and the costliest mistake (in the spirit of King Takes King) ---- */
+const DIMS = [['attack', 'Attacco'], ['solid', 'Solidità'], ['opening', 'Apertura'], ['endgame', 'Finale'], ['convert', 'Concretezza'], ['calm', 'Gestione tempo']];
+const LEGENDS = [
+  { n: 'Mikhail Tal', i: 'T', d: 'Il mago di Riga: attacchi, sacrifici e complicazioni dove l\'avversario si perde.', v: { attack: 1, solid: .3, opening: .5, endgame: .4, convert: .8, calm: .4 } },
+  { n: 'José Raúl Capablanca', i: 'C', d: 'Semplicità e tecnica: posizioni pulite e finali vinti quasi senza sforzo.', v: { attack: .4, solid: .9, opening: .5, endgame: 1, convert: .8, calm: .9 } },
+  { n: 'Tigran Petrosian', i: 'P', d: 'Prima di tutto non perdere: prevenzione, difesa e pazienza.', v: { attack: .2, solid: 1, opening: .6, endgame: .7, convert: .5, calm: .8 } },
+  { n: 'Bobby Fischer', i: 'F', d: 'Aperture preparatissime, gioco limpido e voglia di vincere ogni partita.', v: { attack: .7, solid: .8, opening: .95, endgame: .8, convert: .9, calm: .7 } },
+  { n: 'Garry Kasparov', i: 'K', d: 'Energia e iniziativa: aperture aggressive e pressione continua.', v: { attack: .9, solid: .7, opening: 1, endgame: .6, convert: .9, calm: .6 } },
+  { n: 'Anatoly Karpov', i: 'A', d: 'Il boa constrictor: toglie spazio e mosse finché l\'avversario soffoca.', v: { attack: .4, solid: .9, opening: .7, endgame: .8, convert: .95, calm: .8 } },
+  { n: 'Magnus Carlsen', i: 'M', d: 'Spreme ogni posizione: anche dai finali pari tira fuori la vittoria.', v: { attack: .6, solid: .9, opening: .6, endgame: 1, convert: 1, calm: 1 } },
+  { n: 'Paul Morphy', i: 'M', d: 'Sviluppo rapido e linee aperte: attacca prima che l\'avversario sia pronto.', v: { attack: .9, solid: .5, opening: .9, endgame: .5, convert: .8, calm: .5 } }
+];
+const clamp01 = (x) => Math.max(0, Math.min(1, x));
+function styleOf(A) {
+  const ph = (p) => (A.phases[p].n ? A.phases[p].acc / A.phases[p].n : null);
+  const accAll = mean(A.accSeries.map((x) => x.acc)) || 0, mid = ph('middlegame') || accAll;
+  let moves = 0; for (const c in A.cls) if (c !== 'book') moves += A.cls[c];
+  const found = Object.values(A.tactics.found).reduce((a, b) => a + b, 0);
+  const T = A.time, lo = per100(T.lowClockErrors, T.lowClockMoves), no = per100(T.normErrors, T.normMoves);
+  return {
+    attack: clamp01(((found + A.brilliants * 2) / Math.max(1, A.analyzed)) / 2.5 * 0.6 + (A.games ? A.decisive / A.games : 0) * 0.4),
+    solid: clamp01(1 - per100(A.cls.blunder, moves) / 6),
+    opening: ph('opening') == null ? .5 : clamp01(.5 + (ph('opening') - mid) / 20),
+    endgame: ph('endgame') == null ? .5 : clamp01(.5 + (ph('endgame') - mid) / 20),
+    convert: A.chances ? clamp01(A.converted / A.chances) : .5,
+    calm: T.lowClockMoves >= 10 && no ? clamp01(1 - (lo / no - 1) / 3) : .7
+  };
+}
+function costLabel(k) {
+  const [t, x] = k.split(':');
+  if (t === 'hang') return { t: 'Lasci in presa ' + (x === 'q' ? 'la donna' : x === 'p' ? 'pedoni' : 'pezzi: ' + Core.PIECE_NAME[x].toLowerCase()), s: 'Muovi senza controllare cosa resta indifeso.' };
+  if (t === 'allow') return { t: 'Concedi ' + Core.TACTIC_NAME[x].toLowerCase(), s: 'Dopo la tua mossa l\'avversario ha questo colpo a disposizione.' };
+  if (t === 'miss') return { t: 'Non vedi ' + Core.TACTIC_NAME[x].toLowerCase(), s: 'Avevi la tattica e hai giocato altro.' };
+  if (t === 'mate') return { t: 'Matti forzati mancati', s: 'C\'era uno scacco matto e la partita è continuata.' };
+  if (t === 'clock') return { t: 'Errori in zeitnot', s: 'Gli errori gravi arrivano sotto i 30 secondi.' };
+  return { t: 'Errori di ' + PHASE_NAME[x].toLowerCase(), s: 'Errori posizionali senza una tattica precisa.' };
+}
+function storyHtml(A) {
+  if (A.analyzed < 3) return '<h2>La tua storia</h2><div class="card story"><p class="muted" style="margin:0">Analizza almeno 3 partite per scoprire a quale leggenda somigli, il tuo punteggio e l\'errore che ti costa di più.</p></div>';
+  const st = styleOf(A);
+  const ranked = LEGENDS.map((L) => { let d = 0; DIMS.forEach(([k]) => { d += (st[k] - L.v[k]) ** 2; }); return { L, m: 100 * (1 - Math.sqrt(d / DIMS.length)) }; }).sort((a, b) => b.m - a.m);
+  const top = ranked[0];
+  // Vik Score (0-1000): accuracy, solidity, conversion, results
+  const acc = mean(A.accSeries.map((x) => x.acc)) || 0, R = A.results, tot = R.win + R.draw + R.loss;
+  const score = Math.round(10 * (0.45 * acc + 20 * st.solid + 15 * st.convert + 20 * (tot ? (R.win + R.draw / 2) / tot : .5)));
+  const lvl = score >= 850 ? 'Livello maestro' : score >= 750 ? 'Giocatore forte' : score >= 650 ? 'Solido da club' : score >= 550 ? 'In crescita' : 'Agli inizi';
+  let h = '<h2>La tua storia</h2><div class="grid2"><div class="card story stack" style="gap:12px"><div class="lbl">Giochi come</div>' +
+    '<div class="legend"><div class="crest">' + top.L.i + '</div><div><div class="lname">' + esc(top.L.n) + '</div><div class="dim small">somiglianza ' + top.m.toFixed(0) + '%</div></div></div>' +
+    '<p class="muted" style="margin:0">' + esc(top.L.d) + '</p>' +
+    '<div class="stack" style="gap:6px">' + DIMS.map(([k, l]) => '<div class="dimrow"><span>' + l + '</span>' + bar(st[k], 1, 'var(--green)') + '<span class="v num">' + Math.round(st[k] * 100) + '</span></div>').join('') + '</div>' +
+    '<div class="others">' + ranked.slice(1, 4).map((x) => '<span>' + esc(x.L.n) + ' ' + x.m.toFixed(0) + '%</span>').join('') + '</div>' +
+    '<p class="dim small" style="margin:0">Stima dal confronto tra il tuo profilo (sulle ' + A.analyzed + ' partite analizzate) e lo stile tipico di ogni campione.</p></div>';
+  h += '<div class="stack" style="gap:14px"><div class="card story"><div class="lbl">Punteggio Vik</div><div class="score"><b class="num">' + score + '</b><span class="muted">/ 1000 · ' + lvl + '</span></div>' +
+    '<p class="dim small" style="margin:6px 0 0">Unisce precisione (' + fmt1(acc) + '), solidità, quanto punisci gli errori avversari e risultati.</p></div>';
+  const keys = Object.keys(A.costs).sort((a, b) => A.costs[b].loss - A.costs[a].loss);
+  if (keys.length && A.lossTotal) {
+    const k = keys[0], C = A.costs[k], lab = costLabel(k), ng = Object.keys(C.games).length;
+    h += '<div class="card cost"><div class="lbl">L\'errore che ti costa di più</div><div style="font-size:19px;font-weight:800;margin-top:4px">' + esc(lab.t) + '</div>' +
+      '<p class="muted small" style="margin:4px 0 0">' + lab.s + ' Vale il <b style="color:var(--text)">' + pct(100 * C.loss / A.lossTotal) + '</b> di tutta la probabilità di vittoria che butti via: ' + times(C.n) + ' in ' + ng + (ng === 1 ? ' partita' : ' partite') + '.</p>' +
+      (C.ex ? '<div class="row" style="margin-top:10px"><button class="btn sm primary" data-open="' + esc(C.ex.id) + '" data-ply="' + (C.ex.i + 1) + '">Vedi il caso peggiore</button>' + (keys[1] ? '<span class="dim small">poi: ' + esc(costLabel(keys[1]).t.toLowerCase()) + '</span>' : '') + '</div>' : '') + '</div>';
+  }
+  return h + '</div></div>';
 }
 function bindStats() {
   const v = $('v-stats');
@@ -901,7 +1092,7 @@ function show(v) {
   if (v === 'puzzle') renderPuzzle();
   if (v === 'review') {
     if (!S.rv.id) { const f = sortedIds()[0]; if (f) openReview(f, 0); else $('v-review').querySelector('.rv').hidden = true; }
-    else drawReview(false);
+    else { drawReview(false); liveThink(); }
   }
   window.scrollTo(0, 0);
 }
@@ -909,6 +1100,20 @@ function refresh() {
   if (S.view === 'games') renderGames();
   if (S.view === 'stats') renderStats();
   progressTick(true);
+}
+
+// Tap = one step; keep pressed = keeps stepping (after a short pause)
+function holdRepeat(btn, fn) {
+  let t1 = 0, t2 = 0, fired = false;
+  const stop = () => { clearTimeout(t1); clearInterval(t2); };
+  btn.addEventListener('pointerdown', (e) => {
+    if (e.button) return;
+    fired = false; stop();
+    t1 = setTimeout(() => { fired = true; fn(); t2 = setInterval(fn, 140); }, 380);
+  });
+  ['pointerup', 'pointerleave', 'pointercancel'].forEach((ev) => btn.addEventListener(ev, stop));
+  btn.addEventListener('click', () => { if (!fired) fn(); fired = false; });
+  btn.addEventListener('contextmenu', (e) => e.preventDefault());
 }
 
 /* ---------------- boot ---------------- */
@@ -924,8 +1129,8 @@ async function boot() {
   setTimeout(migrateCompact, 1500);
   document.querySelectorAll('.nav button').forEach((b) => { b.onclick = () => show(b.dataset.view); });
   document.addEventListener('click', (e) => {
-    const gi = e.target.closest('.gi[data-id]');
-    if (gi) { show('review'); openReview(gi.dataset.id, gi.dataset.ply ? +gi.dataset.ply : 0); }
+    const gi = e.target.closest('.gi[data-id], [data-open]');
+    if (gi) { const id = gi.dataset.id || gi.dataset.open; show('review'); openReview(id, gi.dataset.ply ? +gi.dataset.ply : 0); }
   });
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && e.target.matches && e.target.matches('.gi[data-id]')) e.target.click();
@@ -934,13 +1139,14 @@ async function boot() {
     if (e.key === 'ArrowRight') { go(1); e.preventDefault(); }
   });
   $('cFirst').onclick = () => { if (S.rv.explore) toggleExplore(false); go(0, 0); };
-  $('cPrev').onclick = () => go(-1);
-  $('cNext').onclick = () => go(1);
+  holdRepeat($('cPrev'), () => go(-1));
+  holdRepeat($('cNext'), () => go(1));
+  $('cLive').onclick = toggleLive;
   $('cLast').onclick = () => { if (S.rv.explore) toggleExplore(false); go(0, 9999); };
   $('cFlip').onclick = () => { S.rv.flip = !S.rv.flip; rvBoard.setOrientation(S.rv.flip ? 'b' : 'w'); drawReview(false); };
   $('cExplore').onclick = () => toggleExplore();
-  $('moves').onclick = (e) => { const b = e.target.closest('button'); if (b) { if (S.rv.explore) { S.rv.explore = null; stopLive(); } go(0, +b.dataset.ply); drawReview(false); } };
-  $('graph').onclick = (e) => { if (!S.rv.id) return; const r = e.currentTarget.getBoundingClientRect(), g = game(S.rv.id); if (S.rv.explore) { S.rv.explore = null; stopLive(); } go(0, Math.round((e.clientX - r.left) / r.width * g.moves.length)); drawReview(false); };
+  $('moves').onclick = (e) => { const b = e.target.closest('button'); if (b) { if (S.rv.explore) { S.rv.explore = null; stopLive(); } go(0, +b.dataset.ply); drawReview(false); liveThink(); } };
+  $('graph').onclick = (e) => { if (!S.rv.id) return; const r = e.currentTarget.getBoundingClientRect(), g = game(S.rv.id); if (S.rv.explore) { S.rv.explore = null; stopLive(); } go(0, Math.round((e.clientX - r.left) / r.width * g.moves.length)); drawReview(false); liveThink(); };
   $('tMoves').onclick = () => { S.rv.tab = 'moves'; $('tMoves').setAttribute('aria-selected', 'true'); $('tSum').setAttribute('aria-selected', 'false'); $('rvMoves').hidden = false; $('rvSum').hidden = true; };
   $('tSum').onclick = () => { S.rv.tab = 'sum'; $('tSum').setAttribute('aria-selected', 'true'); $('tMoves').setAttribute('aria-selected', 'false'); $('rvMoves').hidden = true; $('rvSum').hidden = false; };
   let sx = null;

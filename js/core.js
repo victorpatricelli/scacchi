@@ -51,6 +51,8 @@ var Core = (function () {
     var link = h.Link || h.Site || '';
     var m = link.match(/\/game\/(?:live|daily)\/(\d+)/) || link.match(/\/game\/(\d+)/);
     if (m) return 'g' + m[1];
+    var li = link.match(/lichess\.org\/([A-Za-z0-9]{8})/);
+    if (li) return 'l' + li[1];
     return 'h' + hashStr(pgn.replace(/\s+/g, ' '));
   }
   function timeClass(tc) {
@@ -73,7 +75,7 @@ var Core = (function () {
     var h = parseHeaders(pgn);
     var u = String(username || '').toLowerCase();
     var white = h.White || '?', black = h.Black || '?';
-    var userColor = white.toLowerCase() === u ? 'w' : (black.toLowerCase() === u ? 'b' : null);
+    var us = u.split('|').filter(Boolean), userColor = us.indexOf(white.toLowerCase()) >= 0 ? 'w' : (us.indexOf(black.toLowerCase()) >= 0 ? 'b' : null);
     var res = h.Result || '*', outcome = null;
     if (userColor) {
       if (res === '1/2-1/2') outcome = 'draw';
@@ -129,7 +131,7 @@ var Core = (function () {
     }
     var u = String(username || '').toLowerCase();
     var white = h.White || '?', black = h.Black || '?';
-    var userColor = white.toLowerCase() === u ? 'w' : (black.toLowerCase() === u ? 'b' : null);
+    var us = u.split('|').filter(Boolean), userColor = us.indexOf(white.toLowerCase()) >= 0 ? 'w' : (us.indexOf(black.toLowerCase()) >= 0 ? 'b' : null);
     var res = h.Result || '*', outcome = null;
     if (userColor) {
       if (res === '1/2-1/2') outcome = 'draw';
@@ -439,7 +441,7 @@ var Core = (function () {
       byClass: {}, pieces: {}, phases: {}, tactics: { missed: {}, allowed: {}, found: {} },
       hung: {}, chances: 0, converted: 0, openings: {}, accSeries: [], ratings: {},
       time: { lowClockMoves: 0, lowClockErrors: 0, normMoves: 0, normErrors: 0, spentByCls: {} },
-      cls: {}, missedMates: 0, worst: [], terminations: {}
+      cls: {}, missedMates: 0, worst: [], terminations: {}, costs: {}, lossTotal: 0, brilliants: 0, decisive: 0
     };
     'pnbrqk'.split('').forEach(function (p) { A.pieces[p] = { n: 0, acc: 0, best: 0, inacc: 0, mist: 0, blun: 0 }; });
     ['opening', 'middlegame', 'endgame'].forEach(function (p) { A.phases[p] = { n: 0, acc: 0, err: 0, blun: 0 }; });
@@ -448,7 +450,7 @@ var Core = (function () {
       var g = e.game, uc = g.userColor;
       if (!uc) return;
       A.games++;
-      if (g.outcome) { A.results[g.outcome]++; A.byColor[uc][g.outcome]++; }
+      if (g.outcome) { A.results[g.outcome]++; A.byColor[uc][g.outcome]++; if (g.outcome !== 'draw') A.decisive++; }
       A.byColor[uc].n++;
       var tcl = g.timeClass;
       if (!A.byClass[tcl]) A.byClass[tcl] = { win: 0, draw: 0, loss: 0, n: 0 };
@@ -489,6 +491,14 @@ var Core = (function () {
           else { A.time.normMoves++; if (err) A.time.normErrors++; }
         }
         if (m.spent != null && g.timeClass !== 'daily') { A.time.spentByCls[m.cls].n++; A.time.spentByCls[m.cls].t += m.spent; }
+        if (m.cls === 'brilliant' || m.cls === 'great') A.brilliants++;
+        if (m.loss >= 10) {
+          var ck = m.hungPiece ? 'hang:' + m.hungPiece : m.allowedTactic ? 'allow:' + m.allowedTactic : m.missedMate ? 'mate' : m.missedTactic ? 'miss:' + m.missedTactic
+            : (m.clock != null && m.clock < 30 && g.timeClass !== 'daily') ? 'clock' : 'phase:' + m.phase;
+          var C = A.costs[ck] || (A.costs[ck] = { loss: 0, n: 0, games: {}, ex: null });
+          C.loss += m.loss; C.n++; C.games[g.id] = 1; A.lossTotal += m.loss;
+          if (!C.ex || m.loss > C.ex.loss) C.ex = { id: g.id, i: m.i, san: m.san, loss: m.loss };
+        }
         if (m.cls === 'blunder') A.worst.push({ id: g.id, i: m.i, loss: m.loss, san: m.san, ts: g.ts });
       });
       if (oa.length) O.openAcc.push(oa.reduce(function (a, b) { return a + b; }, 0) / oa.length);

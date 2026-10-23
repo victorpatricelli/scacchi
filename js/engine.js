@@ -15,6 +15,7 @@ export class Engine {
   constructor() {
     this.w = new Worker(ENGINE_URL);
     this.cb = null; this.lines = []; this.multipv = 1; this.dead = false; this.listeners = new Set();
+    this.searching = false; this._idle = []; this._lock = Promise.resolve();
     this.ready = new Promise((res, rej) => {
       this._ready = res;
       this._t = setTimeout(() => rej(new Error('Il motore non risponde')), 45000);
@@ -34,7 +35,10 @@ export class Engine {
       this.listeners.forEach((fn) => fn(this.lines.slice(0, this.multipv), info.depth));
     }
     if (s.startsWith('bestmove')) {
+      this.searching = false;
+      const idle = this._idle; this._idle = [];
       const cb = this.cb; this.cb = null;
+      idle.forEach((r) => r());
       if (cb) {
         const lines = this.lines.slice(0, this.multipv).filter(Boolean);
         if (!lines.length) lines.push({ cp: 0, pv: [s.split(' ')[1]].filter((m) => m && m !== '(none)') });
@@ -54,30 +58,50 @@ export class Engine {
     if (elo) this.send('setoption name UCI_Elo value ' + elo);
     this.send('setoption name Skill Level value ' + skill);
   }
-  async analyze(fen, { depth = 16, movetime = 3000, multipv = 2 } = {}) {
-    await this.ready;
-    if (this.dead) throw new Error('stopped');
-    this.setMultiPV(multipv);
-    return new Promise((res, rej) => {
-      this.cb = { res, rej }; this.lines = [];
-      this.send('position fen ' + fen);
-      this.send('go depth ' + depth + (movetime ? ' movetime ' + movetime : ''));
+  // Serialise commands: a new search starts only after the previous one has really ended,
+  // so a late "bestmove" can never be mistaken for the answer to a newer request.
+  _exclusive(fn) {
+    const run = this._lock.then(fn, fn);
+    this._lock = run.then(() => {}, () => {});
+    return run;
+  }
+  _halt() {
+    this.listeners.clear();
+    if (!this.searching) return Promise.resolve();
+    this.send('stop');
+    return new Promise((r) => this._idle.push(r));
+  }
+  analyze(fen, { depth = 16, movetime = 3000, multipv = 2 } = {}) {
+    let result;
+    return this._exclusive(async () => {
+      await this.ready;
+      if (this.dead) throw new Error('stopped');
+      await this._halt();
+      this.setMultiPV(multipv);
+      result = new Promise((res, rej) => {
+        this.cb = { res, rej }; this.lines = []; this.searching = true;
+        this.send('position fen ' + fen);
+        this.send('go depth ' + depth + (movetime ? ' movetime ' + movetime : ''));
+      });
+      return result; // keep the lock until this search is over
     });
   }
-  // Streaming analysis for the explorer; returns a stop function
-  async think(fen, onUpdate, { multipv = 3, depth = 22 } = {}) {
-    await this.ready;
-    this.stop();
-    await new Promise((r) => setTimeout(r, 30));
-    this.setMultiPV(multipv);
-    this.lines = [];
-    const fn = (lines, d) => onUpdate(lines, d);
-    this.listeners.clear(); this.listeners.add(fn);
-    this.cb = { res: () => {}, rej: () => {} };
-    this.send('position fen ' + fen);
-    this.send('go depth ' + depth);
+  // Streaming analysis (explorer, live mode): onUpdate(lines, depth) while it thinks
+  think(fen, onUpdate, { multipv = 3, depth = 22 } = {}) {
+    return this._exclusive(async () => {
+      await this.ready;
+      if (this.dead) throw new Error('stopped');
+      await this._halt();
+      this.setMultiPV(multipv);
+      this.lines = [];
+      this.listeners.add((lines, d) => onUpdate(lines, d));
+      this.cb = { res: () => {}, rej: () => {} };
+      this.searching = true;
+      this.send('position fen ' + fen);
+      this.send('go depth ' + depth);
+    });
   }
-  stop() { this.listeners.clear(); if (this.cb) this.send('stop'); }
+  stop() { this.listeners.clear(); if (this.searching) this.send('stop'); }
   kill() {
     this.dead = true;
     try { this.w.terminate(); } catch (e) { /* ignore */ }
