@@ -38,12 +38,22 @@ export class Engine {
       if (cb) {
         const lines = this.lines.slice(0, this.multipv).filter(Boolean);
         if (!lines.length) lines.push({ cp: 0, pv: [s.split(' ')[1]].filter((m) => m && m !== '(none)') });
-        cb.res({ lines });
+        const bm = s.split(' ')[1];
+        cb.res({ lines, best: bm && bm !== '(none)' ? bm : (lines[0] && lines[0].pv[0]) || '' });
       }
     }
   }
   setMultiPV(n) { if (n !== this.multipv) { this.multipv = n; this.send('setoption name MultiPV value ' + n); } }
   newGame() { this.send('ucinewgame'); }
+  // Strength for playing: elo (1320-3190) via UCI_LimitStrength, or skill 0-20; null = full strength.
+  setStrength({ elo = null, skill = 20 } = {}) {
+    const key = elo + '/' + skill;
+    if (key === this._str) return;
+    this._str = key;
+    this.send('setoption name UCI_LimitStrength value ' + (elo ? 'true' : 'false'));
+    if (elo) this.send('setoption name UCI_Elo value ' + elo);
+    this.send('setoption name Skill Level value ' + skill);
+  }
   async analyze(fen, { depth = 16, movetime = 3000, multipv = 2 } = {}) {
     await this.ready;
     if (this.dead) throw new Error('stopped');

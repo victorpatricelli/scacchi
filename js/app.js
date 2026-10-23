@@ -2,6 +2,7 @@ import { Board } from './board.js';
 import { Engine, DEPTHS, poolSize } from './engine.js';
 import { store } from './store.js';
 import * as CC from './chesscom.js';
+import { createPlay } from './play.js';
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -31,7 +32,7 @@ const S = {
   run: { on: false, engines: [], queue: [], override: {}, done: 0, total: 0, games: 0, gamesTotal: 0, t0: 0, label: '' },
   syncing: false, syncMsg: '', limit: 60
 };
-let rvBoard = null, pzBoard = null, liveEngine = null;
+let rvBoard = null, pzBoard = null, liveEngine = null, play = null;
 
 /* ---------------- utilities ---------------- */
 function toast(t) { const el = $('toast'); el.textContent = t; el.hidden = false; clearTimeout(toast.t); toast.t = setTimeout(() => { el.hidden = true; }, 3400); }
@@ -389,6 +390,13 @@ function bindSettings() {
     store.putGames(list).then(analyzeAll);
   });
 }
+function analyzeBotGame(text) {
+  const g = Core.parseMeta(text, S.settings.user);
+  if (!S.recs.has(g.id)) addPGNs([{ pgn: text }], 'bot');
+  const rec = S.recs.get(g.id);
+  if (rec && !rec.an) enqueue([g.id], true);
+  show('review'); openReview(g.id, 0);
+}
 function importText(t) {
   const parts = Core.splitPGN(t).map((pgn) => ({ pgn }));
   const before = S.recs.size, n = addPGNs(parts, 'import');
@@ -437,7 +445,7 @@ function playerBar(el, color, g, ply) {
   const isMe = g.userColor === color, av = isMe && S.profile && S.profile.avatar ? S.profile.avatar : '';
   const turn = g.fens[ply].split(' ')[1] === color;
   el.innerHTML = '<div class="av" style="' + (av ? 'background-image:url(' + esc(av) + ')' : '') + '">' + (av ? '' : esc(name[0] || '?').toUpperCase()) + '</div>' +
-    '<span class="nm">' + esc(name) + ' <span class="el num">(' + (elo || '?') + ')</span></span>' +
+    '<span class="nm">' + esc(name) + (elo ? ' <span class="el num">(' + elo + ')</span>' : '') + '</span>' +
     (clk != null ? '<span class="clk num' + (color === 'w' ? ' white' : '') + '" style="' + (turn ? '' : 'opacity:.6') + '">' + fmtClock(clk) + '</span>' : '');
 }
 function curFen() {
@@ -532,10 +540,11 @@ function renderCoach(g, rv, an, ply, ev) {
   if (m.cls === 'brilliant') lines.push('Sacrificio corretto: il motore lo conferma.');
   if (m.cls === 'great') lines.push("Era l'unica mossa che teneva la posizione.");
   if (m.missedMate) lines.push("C'era un matto forzato.");
-  if (m.cls === 'miss' && !m.missedMate) lines.push("L'avversario aveva appena sbagliato e potevi approfittarne.");
-  if (m.allowedTactic && an.best[ply]) lines.push('Ora l\'avversario ha <b class="num">' + esc(Core.sanOf(g.fens[ply], an.best[ply])) + '</b> (' + esc(Core.TACTIC_NAME[m.allowedTactic].toLowerCase()) + ').');
+  const mine = m.side === g.userColor;
+  if (m.cls === 'miss' && !m.missedMate) lines.push(mine ? "L'avversario aveva appena sbagliato e potevi approfittarne." : "Avevi appena sbagliato e l'avversario poteva approfittarne.");
+  if (m.allowedTactic && an.best[ply]) lines.push((mine ? 'Ora l\'avversario ha <b' : 'Ora avresti <b') + ' class="num">' + esc(Core.sanOf(g.fens[ply], an.best[ply])) + '</b> (' + esc(Core.TACTIC_NAME[m.allowedTactic].toLowerCase()) + ').');
   if (m.hungPiece) lines.push('Pezzo lasciato in presa: ' + Core.PIECE_NAME[m.hungPiece].toLowerCase() + '.');
-  if (m.foundTactic) lines.push('Hai sfruttato l\'errore con ' + esc(Core.TACTIC_NAME[m.foundTactic].toLowerCase()) + '.');
+  if (m.foundTactic) lines.push((mine ? 'Hai sfruttato l\'errore con ' : 'L\'avversario ha sfruttato il tuo errore con ') + esc(Core.TACTIC_NAME[m.foundTactic].toLowerCase()) + '.');
   if (m.loss >= 2 && m.cls !== 'book') lines.push('<span class="dim">Probabilità di vittoria: ' + m.before.toFixed(0) + '% → ' + m.after.toFixed(0) + '%' + (m.spent != null ? ' · pensata ' + m.spent.toFixed(1) + ' s' : '') + '</span>');
   else if (m.spent != null) lines.push('<span class="dim">Pensata ' + m.spent.toFixed(1) + ' s</span>');
   box.innerHTML = ci(m.cls) + '<div class="bubble"><div class="head"><span class="hd"><span class="num">' + num + ' ' + esc(mv.san) + '</span> <span class="ct c-' + m.cls + '">' + PHRASE[m.cls] + '</span></span>' + evBadge + '</div>' +
@@ -638,7 +647,7 @@ function stopLive() { if (liveEngine) liveEngine.stop(); }
 
 /* ---------------- view: stats ---------------- */
 function statsEntries() {
-  return sortedIds().map((id) => ({ game: meta(id), rv: crev(id) })).filter((e) => e.game.userColor &&
+  return sortedIds().filter((id) => S.recs.get(id).src !== 'bot').map((id) => ({ game: meta(id), rv: crev(id) })).filter((e) => e.game.userColor &&
     (S.stats.tc === 'all' || e.game.timeClass === S.stats.tc) && (S.stats.color === 'all' || e.game.userColor === S.stats.color));
 }
 function renderStats() {
@@ -879,7 +888,12 @@ function pzMove(from, to) {
 /* ---------------- navigation ---------------- */
 function show(v) {
   S.view = v;
-  ['games', 'review', 'stats', 'puzzle'].forEach((k) => { $('v-' + k).hidden = k !== v; });
+  ['games', 'review', 'play', 'stats', 'puzzle'].forEach((k) => { $('v-' + k).hidden = k !== v; });
+  if (v !== 'play' && play) play.hide();
+  if (v === 'play') {
+    if (!play) play = createPlay({ root: $('v-play'), store, sound, toast, user: () => S.settings.user, profile: () => S.profile, onAnalyze: analyzeBotGame });
+    play.show();
+  }
   document.querySelectorAll('.nav button').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.view === v)));
   if (v !== 'review') stopLive();
   if (v === 'games') renderGames();
