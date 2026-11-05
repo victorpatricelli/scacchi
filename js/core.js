@@ -13,7 +13,8 @@ var Core = (function () {
   var TACTIC_NAME = {
     mate: 'Matto', fork: 'Forchetta', discovered: 'Attacco di scoperta', pin: 'Inchiodatura',
     skewer: 'Infilata', hanging: 'Pezzo in presa', trade_up: 'Cattura vantaggiosa',
-    promotion: 'Promozione', positional: 'Mossa posizionale'
+    promotion: 'Promozione', positional: 'Mossa posizionale', sacrifice: 'Sacrificio', deflection: 'Deviazione',
+    endgame: 'Finale', defense: 'Difesa'
   };
   var START = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
 
@@ -98,12 +99,12 @@ var Core = (function () {
   }
   // Small, storable version of a review (what stats and puzzles need).
   var KEEP = ['i', 'side', 'san', 'uci', 'piece', 'cls', 'acc', 'loss', 'before', 'phase', 'best', 'clock', 'spent',
-    'missedTactic', 'allowedTactic', 'hungPiece', 'chance', 'converted', 'foundTactic', 'missedMate', 'pv'];
+    'missedTactic', 'allowedTactic', 'hungPiece', 'chance', 'converted', 'foundTactic', 'missedMate', 'pv', 'cpl', 'missedBrill'];
   function compactReview(game, rv) {
     return rv.map(function (m) {
       var o = {};
       KEEP.forEach(function (k) { if (m[k] != null && m[k] !== false) o[k] = typeof m[k] === 'number' && k !== 'i' ? Math.round(m[k] * 10) / 10 : m[k]; });
-      if (m.side === game.userColor && (m.cls === 'blunder' || m.cls === 'mistake' || m.cls === 'miss')) o.fen = game.fens[m.i];
+      if (m.side === game.userColor && (m.cls === 'blunder' || m.cls === 'mistake' || m.cls === 'miss' || m.missedBrill)) o.fen = game.fens[m.i];
       return o;
     });
   }
@@ -181,6 +182,27 @@ var Core = (function () {
     if (x == null) return null;
     if (Math.abs(x) >= 90000) { var m = 100000 - Math.abs(x); return { mate: (x > 0 ? 1 : -1) * Math.max(m, 0.001) }; }
     return { cp: x };
+  }
+
+  function cpOf(ev) { if (!ev) return 0; if (ev.mate != null) return ev.mate > 0 ? 1000 : -1000; return Math.max(-1000, Math.min(1000, ev.cp)); }
+
+  /* ---------- estimated playing strength of one game ---------- */
+  // Two rough, independent estimates averaged: from accuracy (Chess.com-style CAPS)
+  // and from average centipawn loss. Both are approximations, not official ratings.
+  var ACC_ELO = [[30, 250], [40, 400], [55, 700], [65, 1000], [72, 1250], [78, 1500], [83, 1750], [87, 2000], [91, 2300], [94, 2550], [96.5, 2800], [98.5, 3100], [100, 3300]];
+  function eloFromAcc(a) {
+    if (a == null) return null;
+    if (a <= ACC_ELO[0][0]) return ACC_ELO[0][1];
+    for (var i = 1; i < ACC_ELO.length; i++) {
+      if (a <= ACC_ELO[i][0]) { var p = ACC_ELO[i - 1], q = ACC_ELO[i]; return p[1] + (q[1] - p[1]) * (a - p[0]) / (q[0] - p[0]); }
+    }
+    return 3300;
+  }
+  function estimateElo(acc, acpl, n) {
+    if (acc == null || (n != null && n < 6)) return null;
+    var e1 = eloFromAcc(acc), e = e1;
+    if (acpl != null) e = (e1 + Math.max(100, 3100 * Math.exp(-0.01 * acpl))) / 2;
+    return Math.round(Math.max(100, Math.min(3200, e)) / 25) * 25;
   }
 
   /* ---------- board geometry (tactics) ---------- */
@@ -317,7 +339,7 @@ var Core = (function () {
           var side = game.moves[i].color;
           var b = winPct(ev[i]), a = winPct(ev[i + 1]);
           var loss = side === 'w' ? b - a : a - b;
-          if (loss >= 10 && pvs[i]) an.pv[i] = pvs[i].slice(0, 7).join(' ');
+          if (pvs[i] && (loss >= 10 || (best[i] && loss >= 2 && isSacrifice(game.fens[i], best[i])))) an.pv[i] = pvs[i].slice(0, 7).join(' ');
         }
         resolve(an);
       }
@@ -381,6 +403,9 @@ var Core = (function () {
         if (isSacrifice(game.fens[i], mv.uci) && after >= 45 && before < 97 && !(evB.mate != null)) cls = 'brilliant';
         else if (isBest && second != null && before - second >= 15 && after >= 35 && before < 97) cls = 'great';
       }
+      var cpl = i <= game.bookUntil || isBest ? 0 : Math.max(0, sign * (cpOf(evB) - cpOf(evA)));
+      var missedBrill = false;
+      if (!isBest && i > game.bookUntil && an.best[i] && cls !== 'brilliant' && ((loss >= 3 && before >= 50 && before < 97) || (hadMate && !keepsMate)) && isSacrifice(game.fens[i], an.best[i])) missedBrill = true;
       var spent = null;
       if (clocks.length === game.moves.length) {
         var prev = i >= 2 ? clocks[i - 2] : game.baseTime;
@@ -391,7 +416,7 @@ var Core = (function () {
         before: before, after: after, loss: loss, acc: cls === 'book' ? 100 : moveAccuracy(loss), cls: cls,
         best: an.best[i] || '', evBefore: evB, evAfter: evA, missedMate: hadMate && !keepsMate,
         chance: chance, phase: phaseOf(game.fens[i], i), clock: clocks[i] != null ? clocks[i] : null, spent: spent,
-        pv: an.pv && an.pv[i] ? an.pv[i].split(' ') : null
+        pv: an.pv && an.pv[i] ? an.pv[i].split(' ') : null, cpl: Math.min(1000, cpl), missedBrill: missedBrill
       });
     }
     // tactic labels on both sides
@@ -424,10 +449,24 @@ var Core = (function () {
     return (ar / list.length + list.length / hr) / 2;
   }
   function gameSummary(game, rv) {
-    var s = { counts: { w: {}, b: {} } }, acc = { w: [], b: [] };
+    var s = { counts: { w: {}, b: {} }, phase: { w: {}, b: {} }, missedBrill: { w: 0, b: 0 } }, acc = { w: [], b: [] }, cp = { w: [], b: [] }, ph = { w: {}, b: {} };
     CLASS.forEach(function (c) { s.counts.w[c] = 0; s.counts.b[c] = 0; });
-    rv.forEach(function (m) { acc[m.side].push(m.acc); s.counts[m.side][m.cls]++; });
+    rv.forEach(function (m) {
+      acc[m.side].push(m.acc); s.counts[m.side][m.cls]++;
+      if (m.missedBrill) s.missedBrill[m.side]++;
+      if (m.cls !== 'book') {
+        if (m.cpl != null) cp[m.side].push(m.cpl);
+        (ph[m.side][m.phase] = ph[m.side][m.phase] || []).push(m.acc);
+      }
+    });
     s.accW = accuracyOf(acc.w); s.accB = accuracyOf(acc.b);
+    ['w', 'b'].forEach(function (c) {
+      ['opening', 'middlegame', 'endgame'].forEach(function (p) { s.phase[c][p] = ph[c][p] && ph[c][p].length >= 2 ? accuracyOf(ph[c][p]) : null; });
+      var a = cp[c].length ? cp[c].reduce(function (x, y) { return x + y; }, 0) / cp[c].length : null;
+      s['acpl' + c.toUpperCase()] = a;
+      s['elo' + c.toUpperCase()] = estimateElo(c === 'w' ? s.accW : s.accB, a, cp[c].length);
+    });
+    s.userElo = game.userColor === 'w' ? s.eloW : game.userColor === 'b' ? s.eloB : null;
     s.userAcc = game.userColor === 'w' ? s.accW : game.userColor === 'b' ? s.accB : null;
     s.oppAcc = game.userColor === 'w' ? s.accB : game.userColor === 'b' ? s.accW : null;
     return s;
@@ -441,7 +480,8 @@ var Core = (function () {
       byClass: {}, pieces: {}, phases: {}, tactics: { missed: {}, allowed: {}, found: {} },
       hung: {}, chances: 0, converted: 0, openings: {}, accSeries: [], ratings: {},
       time: { lowClockMoves: 0, lowClockErrors: 0, normMoves: 0, normErrors: 0, spentByCls: {} },
-      cls: {}, missedMates: 0, worst: [], terminations: {}, costs: {}, lossTotal: 0, brilliants: 0, decisive: 0
+      cls: {}, missedMates: 0, worst: [], terminations: {}, costs: {}, lossTotal: 0, brilliants: 0, decisive: 0,
+      eloSeries: [], missedBrill: 0, missedBrillEx: null
     };
     'pnbrqk'.split('').forEach(function (p) { A.pieces[p] = { n: 0, acc: 0, best: 0, inacc: 0, mist: 0, blun: 0 }; });
     ['opening', 'middlegame', 'endgame'].forEach(function (p) { A.phases[p] = { n: 0, acc: 0, err: 0, blun: 0 }; });
@@ -464,6 +504,7 @@ var Core = (function () {
       A.analyzed++;
       var sum = gameSummary(g, e.rv);
       if (sum.userAcc != null) { A.byColor[uc].acc.push(sum.userAcc); O.acc.push(sum.userAcc); A.accSeries.push({ ts: g.ts, acc: sum.userAcc, opp: sum.oppAcc, id: g.id }); }
+      if (sum.userElo) A.eloSeries.push({ ts: g.ts, est: sum.userElo, elo: elo || null, tc: tcl, id: g.id });
       var oa = [];
       e.rv.forEach(function (m) {
         if (m.side !== uc) return;
@@ -486,6 +527,7 @@ var Core = (function () {
         if (m.hungPiece) A.hung[m.hungPiece] = (A.hung[m.hungPiece] || 0) + 1;
         if (m.chance) { A.chances++; if (m.converted) A.converted++; }
         if (m.missedMate) A.missedMates++;
+        if (m.missedBrill) { A.missedBrill++; if (!A.missedBrillEx || g.ts > A.missedBrillEx.ts) A.missedBrillEx = { id: g.id, i: m.i, ts: g.ts }; }
         if (m.clock != null && g.timeClass !== 'daily') {
           if (m.clock < 30) { A.time.lowClockMoves++; if (err) A.time.lowClockErrors++; }
           else { A.time.normMoves++; if (err) A.time.normErrors++; }
@@ -506,6 +548,7 @@ var Core = (function () {
     A.worst.sort(function (a, b) { return b.loss - a.loss; });
     A.worst = A.worst.slice(0, 10);
     A.accSeries.sort(function (a, b) { return a.ts - b.ts; });
+    A.eloSeries.sort(function (a, b) { return a.ts - b.ts; });
     for (var k in A.ratings) A.ratings[k].sort(function (a, b) { return a.ts - b.ts; });
     return A;
   }
@@ -515,18 +558,51 @@ var Core = (function () {
     var out = [], uc = game.userColor;
     if (!uc) return out;
     rv.forEach(function (m) {
-      if (m.side !== uc || !(m.cls === 'blunder' || m.cls === 'mistake' || m.cls === 'miss')) return;
+      if (m.side !== uc) return;
+      var err = m.cls === 'blunder' || m.cls === 'mistake' || m.cls === 'miss';
+      if (!err && !m.missedBrill) return;
       if (!m.best || m.before < 30) return; // skip lost positions
+      var fen = m.fen || (game.fens && game.fens[m.i]);
+      if (!fen) return;
       var sol = m.pv && m.pv.length ? m.pv.slice(0, 5) : [m.best];
       if (sol.length % 2 === 0) sol = sol.slice(0, sol.length - 1);
-      out.push({ id: game.id + ':' + m.i, gameId: game.id, ply: m.i, fen: m.fen || game.fens[m.i], solution: sol, played: m.uci, cls: m.cls, theme: m.missedTactic || null, loss: m.loss, ts: game.ts });
+      out.push({ id: game.id + ':' + m.i, gameId: game.id, ply: m.i, fen: fen, solution: sol, played: m.uci, cls: m.missedBrill && !err ? 'brilliant' : m.cls,
+        theme: m.missedTactic || null, missedMate: !!m.missedMate, brill: !!m.missedBrill, phase: m.phase || null, loss: m.loss, ts: game.ts });
     });
     return out;
+  }
+  // Tactical themes of a puzzle: looks at every move of the solution, not only the first one.
+  function puzzleThemes(p) {
+    var th = {}, fen = p.fen, sol = p.solution;
+    try {
+      if (p.missedMate) th.mate = 1;
+      if (p.brill || isSacrifice(fen, sol[0])) th.sacrifice = 1;
+      if (p.theme && p.theme !== 'positional') th[p.theme] = 1;
+      for (var k = 0; k < sol.length; k++) {
+        var r = applyUci(fen, sol[k]);
+        if (!r) break;
+        if (k % 2 === 0) {
+          if (r.mate) th.mate = 1;
+          var t = tacticOf(fen, sol[k], false);
+          if (t && t !== 'positional') th[t] = 1;
+          // deflection: a check or capture that drags a defender away, then a capture/mate follows
+          if (k === 0 && sol.length >= 3 && (r.check || r.move.captured)) {
+            var r2 = applyUci(r.fen, sol[1]), r3 = r2 && applyUci(r2.fen, sol[2]);
+            if (r3 && (r3.mate || (r3.move.captured && VAL[r3.move.captured] >= 3 && r3.move.captured !== (r.move.captured || '')))) th.deflection = 1;
+          }
+        }
+        fen = r.fen;
+      }
+    } catch (e) { /* malformed line: keep what we have */ }
+    if (p.phase === 'endgame') th.endgame = 1;
+    var keys = Object.keys(th);
+    return keys.length ? keys : ['positional'];
   }
 
   return {
     START: START, setBook: setBook, parseMeta: parseMeta, compactReview: compactReview, epdKey: epdKey, splitPGN: splitPGN, parseHeaders: parseHeaders, parseGame: parseGame,
-    analyzeGame: analyzeGame, review: review, gameSummary: gameSummary, aggregate: aggregate, puzzlesFrom: puzzlesFrom,
+    analyzeGame: analyzeGame, review: review, gameSummary: gameSummary, aggregate: aggregate, puzzlesFrom: puzzlesFrom, puzzleThemes: puzzleThemes,
+    estimateElo: estimateElo, isSacrifice: isSacrifice, timeBase: function (tc) { if (!tc || tc === '-' || tc.indexOf('/') >= 0) return null; return +tc.split('+')[0] || 0; },
     winPct: winPct, evalText: evalText, packEv: packEv, unpackEv: unpackEv, tacticOf: tacticOf, board: board,
     sanOf: sanOf, pvSan: pvSan, applyUci: applyUci,
     TACTIC_NAME: TACTIC_NAME, PIECE_NAME: PIECE_NAME, VAL: VAL, CLASS: CLASS, CLASS_NAME: CLASS_NAME, CLASS_SYM: CLASS_SYM

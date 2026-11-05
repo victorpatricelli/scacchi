@@ -60,6 +60,15 @@ export class Board {
   place(el, sq) { const [x, y] = this.xy(sq); el.style.transform = 'translate(' + x * 100 + '%,' + y * 100 + '%)'; }
   set(fen, o = {}) {
     if (!fen) return;
+    // Same position (e.g. the engine just sent a new line): only redraw arrows and highlights,
+    // so a piece the user has selected or is dragging stays in hand.
+    if (fen === this.state.fen && Object.keys(this.pieces).length) {
+      this.state = { fen, lastMove: o.lastMove || null, arrows: o.arrows || [], mark: o.mark || null, check: o.check || null };
+      if (this.sel && !this.pieces[this.sel]) this.sel = null;
+      this.paint();
+      return;
+    }
+    this.grabbed = false;
     const animate = o.animate !== false && !window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     const next = parseFen(fen), old = this.pieces, keep = {}, fresh = [];
     const leftovers = {};
@@ -129,7 +138,13 @@ export class Board {
       this.markLayer.appendChild(m);
     }
   }
-  setMovable(dests) { this.dests = dests; this.sel = null; this.el.classList.toggle('movable', !!dests); this.paint(); }
+  setMovable(dests) {
+    const same = JSON.stringify(dests) === JSON.stringify(this.dests);
+    this.dests = dests;
+    if (!same && !(this.sel && dests && dests[this.sel])) this.sel = null;
+    this.el.classList.toggle('movable', !!dests);
+    this.paint();
+  }
   flash(sq, kind) {
     const e = this.sqEls[sq]; if (!e) return;
     e.classList.remove('ok', 'ko'); void e.offsetWidth; e.classList.add(kind);
@@ -158,6 +173,7 @@ export class Board {
         this.sel = sq; this.paint();
         const el = this.pieces[sq];
         if (el) {
+          this.grabbed = true;
           drag = { from: sq, el, sx: ev.clientX, sy: ev.clientY, moved: false, r: p.r };
           this.el.setPointerCapture(ev.pointerId);
         }
@@ -174,6 +190,7 @@ export class Board {
       drag.el.style.transform = 'translate(' + x + 'px,' + y + 'px) scale(1.12)';
     });
     const end = (ev) => {
+      setTimeout(() => { this.grabbed = false; }, 0);
       if (!drag) return;
       const d = drag; drag = null;
       d.el.classList.remove('drag');
