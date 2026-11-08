@@ -342,3 +342,5 @@ details.more summary { cursor: pointer; font-weight: 600; color: var(--text-2); 
 .lab-pal button img { width: 100%; height: 100%; display: block; }
 .lab-pal button[aria-pressed="true"], #lbEraser[aria-pressed="true"] { background: var(--panel-2); box-shadow: inset 0 0 0 2px var(--green); }
 #v-lab .ctrls .icon-btn:disabled { opacity: .4; }
+.lab-playbtn { width: 100%; }
+.lab-playbtn svg { flex: none; }

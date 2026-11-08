@@ -3,6 +3,7 @@
 // in the candidate lines, deeper inside the best line, and on the moves you play.
 import { Board } from './board.js';
 import { Engine } from './engine.js';
+import { LEVELS } from './play.js';
 
 const START = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
 const DEPTH_OPTS = [10, 14, 18, 22, 26, 30, 0]; // 0 = no limit
@@ -51,19 +52,23 @@ export function createLab(ctx) { // ctx: {root, store, sound, toast, visible()}
     fen0: START, moves: [], sans: [], fens: [START], ply: 0, flip: false,
     depth: 22, multipv: 3, on: true,
     lines: [], depthNow: 0, done: false, t0: 0,
-    mode: 'analyze', edit: null
+    mode: 'analyze', edit: null,
+    game: null, gsetup: { level: 5, color: 'turn' }, setupOpen: false
   };
   const cache = new Map(); // fen -> {lines, depth, full}
   let engine = null, board = null, tok = 0, paintT = 0, clockT = 0, built = false;
+  let botEngine = null, gtok = 0;
 
   function eng() { if (!engine) engine = new Engine(); return engine; }
-  function save() { ctx.store.set('lab', { fen0: L.fen0, moves: L.moves, ply: L.ply, flip: L.flip, depth: L.depth, multipv: L.multipv, on: L.on }).catch(() => {}); }
+  function save() { ctx.store.set('lab', { fen0: L.fen0, moves: L.moves, ply: L.ply, flip: L.flip, depth: L.depth, multipv: L.multipv, on: L.on, game: L.game ? Object.assign({}, L.game, { thinking: false }) : null, gsetup: L.gsetup }).catch(() => {}); }
   async function load() {
     try {
       const d = await ctx.store.get('lab');
       if (d) {
         Object.assign(L, { depth: d.depth != null ? d.depth : 22, multipv: d.multipv || 3, on: d.on !== false, flip: !!d.flip });
         setLine(d.fen0 || START, d.moves || [], d.ply);
+        if (d.gsetup) L.gsetup = d.gsetup;
+        if (d.game && d.game.startPly <= L.moves.length) { L.game = d.game; L.ply = L.moves.length; }
       }
     } catch (e) { /* ignore */ }
   }
@@ -87,6 +92,7 @@ export function createLab(ctx) { // ctx: {root, store, sound, toast, visible()}
     const my = tok, fen = curFen(), have = cache.get(fen);
     L.lines = have ? have.lines : []; L.depthNow = have ? have.depth : 0; L.done = false; L.t0 = Date.now();
     if (L.mode !== 'analyze') return;
+    if (L.game || L.setupOpen) { L.lines = []; drawBoard(false); paintEval(); paintMoves(); paintCtrls(); return; } // playing: no engine help
     const ch = new Chess(fen);
     if (ch.game_over()) { L.lines = []; L.done = true; paint(); return; }
     if (have && have.full && L.depth && have.depth >= L.depth) { L.done = true; paint(); return; }
@@ -167,9 +173,13 @@ export function createLab(ctx) { // ctx: {root, store, sound, toast, visible()}
     return true;
   }
   function userMove(from, to, promo) {
+    const G = L.game;
+    if (G && (G.result || G.thinking || turnOf(curFen()) !== G.color)) return;
     const c = new Chess(curFen()), p = c.get(from);
     if (!promo && p && p.type === 'p' && (to[1] === '8' || to[1] === '1')) { askPromotion(from, to, p.color); return; }
-    if (play(from + to + (promo || ''))) { drawAll(true); analyze(); }
+    if (!play(from + to + (promo || ''))) return;
+    if (G) { if (!gameOver()) { save(); drawAll(true); botMove(); } return; }
+    drawAll(true); analyze();
   }
   function askPromotion(from, to, col) {
     const box = ctx.root.querySelector('#lbPromo');
@@ -178,6 +188,7 @@ export function createLab(ctx) { // ctx: {root, store, sound, toast, visible()}
     box.onclick = (e) => { const b = e.target.closest('button'); if (!b) return; box.hidden = true; if (b.dataset.p) userMove(from, to, b.dataset.p); else drawBoard(false); };
   }
   function goTo(p) {
+    if (L.game) return;
     p = Math.max(0, Math.min(L.moves.length, p));
     if (p === L.ply) return;
     const fwd = p === L.ply + 1, near = Math.abs(p - L.ply) === 1;
@@ -190,6 +201,159 @@ export function createLab(ctx) { // ctx: {root, store, sound, toast, visible()}
     for (let i = 0; i <= upto && i < l.pv.length; i++) if (!play(l.pv[i], i < upto)) break;
     ctx.sound('move');
     drawAll(true); analyze();
+  }
+
+  /* ---------- playing against the computer from any position ---------- */
+  function bot() { if (!botEngine) botEngine = new Engine(); return botEngine; }
+  function chessAt(ply) { // with history, so threefold repetition is detected
+    const c = new Chess(L.fen0);
+    for (let i = 0; i < ply; i++) { const u = L.moves[i]; c.move({ from: u.slice(0, 2), to: u.slice(2, 4), promotion: u[4] || undefined }); }
+    return c;
+  }
+  function startGame() {
+    stopEngine(); gtok++;
+    const fen = curFen(), S = L.gsetup;
+    if (new Chess(fen).game_over()) { ctx.toast('Da questa posizione la partita è già finita'); return; }
+    const color = S.color === 'turn' ? turnOf(fen) : S.color;
+    L.moves.splice(L.ply); L.sans.splice(L.ply); L.fens.splice(L.ply + 1);
+    L.game = { color, level: S.level, startPly: L.ply, startFen: fen, result: null, reason: '', thinking: false, takebacks: 0 };
+    L.setupOpen = false; L.flip = color === 'b';
+    bot().newGame();
+    save(); build();
+    botMove();
+  }
+  function gameOver() {
+    const G = L.game; if (!G || G.result) return !!(G && G.result);
+    const c = chessAt(L.ply);
+    let res = null, why = '';
+    if (c.in_checkmate()) { res = c.turn() === 'w' ? '0-1' : '1-0'; why = 'scacco matto'; }
+    else if (c.in_stalemate()) { res = '1/2-1/2'; why = 'stallo'; }
+    else if (c.in_threefold_repetition()) { res = '1/2-1/2'; why = 'tripla ripetizione'; }
+    else if (c.insufficient_material()) { res = '1/2-1/2'; why = 'materiale insufficiente'; }
+    else if (c.in_draw()) { res = '1/2-1/2'; why = 'regola delle 50 mosse'; }
+    if (!res) return false;
+    endGame(res, why);
+    return true;
+  }
+  function endGame(res, why) {
+    const G = L.game; gtok++;
+    G.result = res; G.reason = why; G.thinking = false;
+    ctx.sound(res === '1/2-1/2' ? 'move' : 'ok');
+    save(); drawAll(false);
+  }
+  async function botMove() {
+    const G = L.game;
+    if (!G || G.result || G.thinking || !ctx.visible()) return;
+    const fen = curFen(); if (turnOf(fen) === G.color) return;
+    const my = ++gtok, t0 = Date.now();
+    G.thinking = true; drawAll(false);
+    const Lv = LEVELS.find((l) => l.n === G.level) || LEVELS[4], c = new Chess(fen);
+    let u = null;
+    try {
+      const legal = c.moves({ verbose: true });
+      if (Lv.random && Math.random() < Lv.random) {
+        const nice = legal.filter((m) => m.captured || /\+/.test(m.san));
+        const pool = nice.length && Math.random() < 0.5 ? nice : legal;
+        const m = pool[Math.floor(Math.random() * pool.length)];
+        u = m.from + m.to + (m.promotion || '');
+      } else {
+        const e = bot();
+        e.setStrength(Lv.uciElo ? { elo: Lv.uciElo } : { skill: Lv.skill == null ? 20 : Lv.skill });
+        const r = await e.analyze(fen, { depth: Lv.depth || 40, movetime: Lv.movetime, multipv: 1 });
+        u = r.best;
+      }
+    } catch (e) { if (my === gtok) ctx.toast('Il computer non risponde, riprova'); }
+    const wait = Math.max(0, 350 + Math.random() * 400 - (Date.now() - t0));
+    await new Promise((r) => setTimeout(r, wait));
+    if (my !== gtok || L.game !== G) return;
+    G.thinking = false;
+    if (!u || !play(u)) { drawAll(false); return; }
+    if (!gameOver()) { save(); drawAll(true); }
+  }
+  function takeback() {
+    const G = L.game; if (!G || G.result) return;
+    gtok++; G.thinking = false;
+    let n = turnOf(curFen()) === G.color ? 2 : 1;
+    n = Math.min(n, L.ply - G.startPly);
+    if (n <= 0) { drawAll(false); botMove(); return; }
+    L.ply -= n; L.moves.splice(L.ply); L.sans.splice(L.ply); L.fens.splice(L.ply + 1);
+    G.takebacks++; save(); drawAll(true);
+    botMove(); // if the computer had the move at the start
+  }
+  function resign() {
+    const G = L.game; if (!G || G.result) return;
+    endGame(G.color === 'w' ? '0-1' : '1-0', 'abbandono');
+  }
+  function rematch() {
+    const G = L.game; if (!G) return;
+    L.ply = G.startPly; L.gsetup = { level: G.level, color: G.color };
+    L.game = null; startGame();
+  }
+  function leaveGame(review) {
+    const G = L.game; gtok++;
+    L.game = null; save(); build();
+    if (review && G) reviewGame(G);
+    analyze();
+  }
+  // after the game: quick pass over its positions so every move gets its judgement (and missed brilliants)
+  async function reviewGame(G) {
+    const my = gtok, e = bot();
+    e.setStrength({ skill: 20 });
+    ctx.toast('Sto giudicando le mosse della partita…');
+    for (let i = G.startPly; i < L.fens.length; i++) {
+      if (my !== gtok || L.game) return;
+      const fen = L.fens[i], have = cache.get(fen);
+      if ((have && have.depth >= 14) || new Chess(fen).game_over()) continue;
+      try {
+        const r = await e.analyze(fen, { depth: 14, movetime: 1500, multipv: 3 });
+        if (my !== gtok) return;
+        const now = cache.get(fen);
+        if (!now || now.depth < 14) cache.set(fen, { lines: r.lines.map((l) => Object.assign({}, l, { pv: l.pv.slice() })), depth: 14, full: false });
+        if (ctx.visible() && L.mode === 'analyze' && !L.game) { paintMoves(); if (i === L.ply || i === L.ply - 1) { drawBoard(false); paintBrill(scanLines(curFen(), L.lines)); } }
+      } catch (err) { return; }
+    }
+  }
+  function gameHtml() {
+    const G = L.game, Lv = LEVELS.find((l) => l.n === G.level) || LEVELS[4];
+    const you = G.color === 'w' ? 'il bianco' : 'il nero';
+    let h = '<div class="card stack lab-game" style="gap:10px"><div class="row" style="gap:8px"><span class="grow"><b>Contro Stockfish</b> · livello ' + Lv.n + ' <span class="dim">(' + esc(Lv.elo) + ')</span></span><span class="dim small">giochi ' + you + '</span></div>';
+    if (G.result) {
+      const win = (G.result === '1-0' && G.color === 'w') || (G.result === '0-1' && G.color === 'b'), draw = G.result === '1/2-1/2';
+      h += '<div class="pz-status ' + (draw ? '' : win ? 'ok' : 'ko') + '"><div><b style="font-size:18px">' + (draw ? 'Patta' : win ? 'Hai vinto!' : 'Hai perso') + '</b><div class="small">' + esc(G.reason) + ' · ' + G.result + '</div></div></div>' +
+        '<button class="btn primary big" id="lbGReview">Analizza la partita</button>' +
+        '<div class="row" style="gap:6px"><button class="btn grow" id="lbGAgain">Rivincita da qui</button><button class="btn grow" id="lbGExit">Chiudi</button></div>';
+    } else {
+      const mine = turnOf(curFen()) === G.color, inCheck = new Chess(curFen()).in_check();
+      h += '<div class="small muted" id="lbGStatus" style="min-height:22px;display:flex;align-items:center;gap:8px">' +
+        (G.thinking ? '<span class="spin" style="width:14px;height:14px;border-width:2px"></span> Il computer sta pensando…' : mine ? (inCheck ? 'Sei sotto scacco!' : 'Tocca a te') : '') + '</div>' +
+        '<div class="ctrls" style="grid-template-columns:repeat(3,1fr)"><button class="btn" id="lbGBack"' + (L.ply > G.startPly ? '' : ' disabled') + '>Annulla</button><button class="btn" id="lbGFlip">Gira</button><button class="btn" id="lbGResign">Abbandona</button></div>' +
+        '<p class="dim small" style="margin:0">Il motore è spento finché giochi: niente frecce, valutazioni o suggerimenti.' + (G.takebacks ? ' Mosse annullate: ' + G.takebacks + '.' : '') + '</p>';
+    }
+    return h + '</div>';
+  }
+  function setupHtml() {
+    const S = L.gsetup;
+    return '<div class="card stack" id="lbSetup" style="gap:14px"><div class="row"><b class="grow">Gioca contro il computer da qui</b><button class="btn sm ghost" id="lbSetupX" aria-label="Chiudi">✕</button></div>' +
+      '<div class="stack" style="gap:8px"><span class="lbl">Livello</span><div class="lvls" id="lbLvl">' +
+      LEVELS.map((l) => '<button aria-pressed="' + (S.level === l.n) + '" data-v="' + l.n + '"><b>' + l.n + '</b><span>' + l.elo + '</span></button>').join('') + '</div>' +
+      '<div class="muted small">' + esc((LEVELS.find((l) => l.n === S.level) || LEVELS[4]).name) + '</div></div>' +
+      '<div class="stack" style="gap:8px"><span class="lbl">Tu giochi</span><div class="seg" id="lbGCol">' +
+      [['turn', 'Di turno'], ['w', 'Bianco'], ['b', 'Nero']].map(([k, l]) => '<button aria-pressed="' + (S.color === k) + '" data-v="' + k + '"><i class="sqc ' + (k === 'turn' ? turnOf(curFen()) : k) + '"></i>' + l + '</button>').join('') + '</div></div>' +
+      '<button class="btn primary big" id="lbGStart">Inizia la partita</button></div>';
+  }
+  function bindGame() {
+    const r = ctx.root, on = (id, fn) => { const e = r.querySelector(id); if (e) e.onclick = fn; };
+    on('#lbGBack', takeback); on('#lbGResign', resign);
+    on('#lbGFlip', () => { L.flip = !L.flip; save(); drawBoard(false); paintEval(); });
+    on('#lbGReview', () => leaveGame(true)); on('#lbGExit', () => leaveGame(false)); on('#lbGAgain', rematch);
+    on('#lbSetupX', () => { L.setupOpen = false; build(); analyze(); });
+    on('#lbGStart', startGame);
+    const pick = (id, key, num) => on(id, (e) => { const b = e.target.closest('button'); if (!b) return; L.gsetup[key] = num ? +b.dataset.v : b.dataset.v; save(); const box = r.querySelector('#lbSetup'); box.outerHTML = setupHtml(); bindGame(); });
+    pick('#lbLvl', 'level', true); pick('#lbGCol', 'color');
+  }
+  function paintGame() {
+    const box = ctx.root.querySelector('.lab-game'); if (!box || !L.game) return;
+    box.outerHTML = gameHtml(); bindGame();
   }
 
   /* ---------- editor ---------- */
@@ -274,7 +438,7 @@ export function createLab(ctx) { // ctx: {root, store, sound, toast, visible()}
     stopEngine();
     setLine(fen, [], 0);
     L.flip = turnOf(fen) === 'b';
-    L.mode = 'analyze'; L.edit = null; save();
+    L.mode = 'analyze'; L.edit = null; L.game = null; L.setupOpen = false; gtok++; save();
     if (built) build();
     if (label) ctx.toast(label);
   }
@@ -288,9 +452,19 @@ export function createLab(ctx) { // ctx: {root, store, sound, toast, visible()}
       board.setMovable(null);
       return;
     }
-    const fen = curFen(), ch = new Chess(fen);
+    const fen = curFen(), ch = new Chess(fen), G = L.game;
     let lastMove = null, mark = null, check = null;
     const arrows = [];
+    if (G || L.setupOpen) {
+      if (L.ply > 0) { const u = L.moves[L.ply - 1]; lastMove = [u.slice(0, 2), u.slice(2, 4)]; }
+      if (ch.in_check()) { const b = Core.board(fen); for (const s in b) if (b[s].t === 'k' && b[s].c === turnOf(fen)) check = s; }
+      board.setOrientation(L.flip ? 'b' : 'w');
+      board.set(fen, { lastMove, check, animate });
+      const d = {};
+      if (!G || (!G.result && !G.thinking && turnOf(fen) === G.color)) ch.moves({ verbose: true }).forEach((m) => { (d[m.from] = d[m.from] || []).push(m.to); });
+      board.setMovable(Object.keys(d).length ? d : null);
+      return;
+    }
     if (L.ply > 0) {
       const u = L.moves[L.ply - 1]; lastMove = [u.slice(0, 2), u.slice(2, 4)];
       const j = judge(L.ply - 1); if (j) mark = { sq: u.slice(2, 4), cls: j.cls };
@@ -315,10 +489,10 @@ export function createLab(ctx) { // ctx: {root, store, sound, toast, visible()}
   }
   function paintEval() {
     const bar = ctx.root.querySelector('#lbEval'); if (!bar) return;
-    const fen = curFen(), l = L.mode === 'analyze' && L.lines[0];
+    const fen = curFen(), l = L.mode === 'analyze' && !L.game && !L.setupOpen && L.lines[0];
     let ev = l ? evOf(l, fen) : null;
     const ch = new Chess(fen);
-    if (L.mode === 'analyze' && ch.in_checkmate()) ev = { mate: turnOf(fen) === 'w' ? -0.001 : 0.001 };
+    if (L.mode === 'analyze' && !L.game && !L.setupOpen && ch.in_checkmate()) ev = { mate: turnOf(fen) === 'w' ? -0.001 : 0.001 };
     const wp = ev ? Core.winPct(ev) : 50;
     bar.classList.toggle('flip', L.flip);
     bar.querySelector('.f').style.height = wp.toFixed(1) + '%';
@@ -384,7 +558,7 @@ export function createLab(ctx) { // ctx: {root, store, sound, toast, visible()}
       const kd = sc.findIndex((s, i) => s && s.deep && s.deep.length && i < Math.max(L.multipv, 1));
       if (kd >= 0) {
         const l = L.lines[kd], i = sc[kd].deep[0], line = Core.pvSan(fen, l.pv, i + 1);
-        const who = i % 2 === 0 ? 'tu' : 'l\'avversario';
+        const who = i % 2 === 0 ? 'chi ha il tratto ora' : 'l\'altro colore';
         h += '<div class="brill-box"><div class="bt">' + ci('brilliant') + 'Sacrificio brillante più avanti nella linea' + (kd ? ' ' + (kd + 1) : ' migliore') + ': <b class="num">' + esc(line[i]) + '!!</b></div>' +
           '<div class="ln">Lo gioca ' + who + ' alla ' + (i + 1) + 'ª semimossa: <span class="num">' + esc(line.join(' ')) + '</span></div>' +
           '<div class="acts"><button class="btn sm" data-line="' + kd + '" data-upto="' + i + '">Vai al sacrificio</button></div></div>';
@@ -413,7 +587,7 @@ export function createLab(ctx) { // ctx: {root, store, sound, toast, visible()}
     const no = startNo(L.fen0), blackFirst = turnOf(L.fen0) === 'b';
     let h = '', i = 0;
     const cell = (j) => {
-      const jd = judge(j), mk = jd && ['brilliant', 'great', 'mistake', 'blunder', 'miss', 'inaccuracy'].includes(jd.cls) ? ci(jd.cls) : '';
+      const jd = L.game ? null : judge(j), mk = jd && ['brilliant', 'great', 'mistake', 'blunder', 'miss', 'inaccuracy'].includes(jd.cls) ? ci(jd.cls) : '';
       return '<button data-ply="' + (j + 1) + '"' + (L.ply === j + 1 ? ' class="on"' : '') + '>' + mk + esc(L.sans[j]) + '</button>';
     };
     if (blackFirst && L.sans.length) { h += '<span class="n">' + no + '.</span><span class="mv">…</span>' + cell(0); i = 1; }
@@ -421,7 +595,7 @@ export function createLab(ctx) { // ctx: {root, store, sound, toast, visible()}
       const n = no + Math.floor((i + (blackFirst ? 1 : 0)) / 2);
       h += '<span class="n">' + n + '.</span>' + cell(i) + (i + 1 < L.sans.length ? cell(i + 1) : '<span></span>');
     }
-    box.innerHTML = h || '<span class="n" style="grid-column:1/-1;padding:8px 10px">Muovi i pezzi sulla scacchiera: puoi giocare per entrambi i colori.</span>';
+    box.innerHTML = h || '<span class="n" style="grid-column:1/-1;padding:8px 10px">' + (L.game ? 'Le mosse della partita appariranno qui.' : 'Muovi i pezzi sulla scacchiera: puoi giocare per entrambi i colori.') + '</span>';
     const on = box.querySelector('button.on');
     if (on) { const top = on.offsetTop - box.offsetTop; if (top < box.scrollTop + 10 || top > box.scrollTop + box.clientHeight - 40) box.scrollTop = Math.max(0, top - box.clientHeight / 2); }
     const fenEl = ctx.root.querySelector('#lbFen'); if (fenEl) fenEl.value = curFen();
@@ -436,10 +610,10 @@ export function createLab(ctx) { // ctx: {root, store, sound, toast, visible()}
   }
   function paint() {
     if (!built || !ctx.visible()) return;
-    if (L.mode === 'edit') return;
+    if (L.mode === 'edit' || L.game) return;
     drawBoard(false); paintEval(); paintEngineHead(); paintLines(); paintMoves(); paintCtrls();
   }
-  function drawAll(animate) { drawBoard(animate); paintEval(); paintEngineHead(); paintLines(); paintMoves(); paintCtrls(); }
+  function drawAll(animate) { drawBoard(animate); paintEval(); paintEngineHead(); paintLines(); paintMoves(); paintCtrls(); paintGame(); }
 
   function paintEditor() {
     const box = ctx.root.querySelector('#lbEdit'); if (!box) return;
@@ -466,38 +640,43 @@ export function createLab(ctx) { // ctx: {root, store, sound, toast, visible()}
     last: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M16 5h2v14h-2zM4 5v14l11-7z"/></svg>',
     flip: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4v16M7 20l-3-3M7 20l3-3M17 20V4M17 4l-3 3M17 4l3 3"/></svg>',
     on: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M13 2 4 14h7l-1 8 10-13h-7z"/></svg>',
+    bot: '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M9 2h6v2h-2v2h4a3 3 0 0 1 3 3v8a3 3 0 0 1-3 3H7a3 3 0 0 1-3-3V9a3 3 0 0 1 3-3h4V4H9zM8.5 11a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3zm7 0a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3zM9 16v1.5h6V16z"/></svg>',
     edit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13.5 6.5l4 4"/></svg>'
   };
   function build() {
     const r = ctx.root;
-    const editing = L.mode === 'edit';
-    r.innerHTML = '<h1 class="lab-h">Analisi libera</h1><div class="rv"><div class="stack" style="gap:8px">' +
-      '<div class="boardwrap"><div class="evalbar" id="lbEval"><div class="f"></div><div class="t"></div></div><div class="pboard"><div id="lbBoard"></div><div class="promo" id="lbPromo" hidden></div></div></div>' +
-      (editing ? '' : '<div class="ctrls" style="grid-template-columns:repeat(7,1fr)">' +
-        '<button class="icon-btn" id="lbFirst" aria-label="Inizio">' + IC.first + '</button>' +
-        '<button class="icon-btn" id="lbPrev" aria-label="Indietro">' + IC.prev + '</button>' +
-        '<button class="icon-btn" id="lbNext" aria-label="Avanti">' + IC.next + '</button>' +
-        '<button class="icon-btn" id="lbLast" aria-label="Fine">' + IC.last + '</button>' +
-        '<button class="icon-btn" id="lbFlip" aria-label="Gira la scacchiera">' + IC.flip + '</button>' +
-        '<button class="icon-btn" id="lbOn" aria-label="Motore acceso o in pausa">' + IC.on + '</button>' +
-        '<button class="icon-btn" id="lbEditBtn" aria-label="Modifica la posizione">' + IC.edit + '</button></div>') +
-      (editing ? '<div class="card stack" id="lbEdit" style="gap:12px"></div>' :
-        '<div class="card lab-engine"><div class="livebox" style="margin:0;padding:0;border:0"><div class="lh" id="lbHead"></div></div>' +
-        '<div class="progress lab-prog" id="lbProg"><i></i></div><div id="lbBrill"></div><div class="lines" id="lbLines" style="margin-top:8px"></div></div>') +
-      '</div><div class="rv-side stack">' +
-      (editing ? '' : '<div class="card stack" style="gap:12px">' +
-        '<div class="stack" style="gap:6px"><span class="lbl">Profondità di analisi</span><div class="chips sm" id="lbDepth">' +
-        DEPTH_OPTS.map((d) => '<button aria-pressed="' + (L.depth === d) + '" data-v="' + d + '">' + (d || '∞') + '</button>').join('') + '</div>' +
-        '<span class="dim small" id="lbDepthHint">' + depthHint() + '</span></div>' +
-        '<div class="stack" style="gap:6px"><span class="lbl">Linee mostrate</span><div class="chips sm" id="lbMpv">' +
-        [1, 2, 3, 4, 5].map((n) => '<button aria-pressed="' + (L.multipv === n) + '" data-v="' + n + '">' + n + '</button>').join('') + '</div></div></div>' +
-        '<div class="moves" id="lbMoves" style="max-height:240px"></div>') +
-      '<div class="card stack" style="gap:10px"><span class="lbl">Posizione</span>' +
+    const editing = L.mode === 'edit', G = L.game, setup = !editing && !G && L.setupOpen;
+    const ctrls = '<div class="ctrls" style="grid-template-columns:repeat(7,1fr)">' +
+      '<button class="icon-btn" id="lbFirst" aria-label="Inizio">' + IC.first + '</button>' +
+      '<button class="icon-btn" id="lbPrev" aria-label="Indietro">' + IC.prev + '</button>' +
+      '<button class="icon-btn" id="lbNext" aria-label="Avanti">' + IC.next + '</button>' +
+      '<button class="icon-btn" id="lbLast" aria-label="Fine">' + IC.last + '</button>' +
+      '<button class="icon-btn" id="lbFlip" aria-label="Gira la scacchiera">' + IC.flip + '</button>' +
+      '<button class="icon-btn" id="lbOn" aria-label="Motore acceso o in pausa">' + IC.on + '</button>' +
+      '<button class="icon-btn" id="lbEditBtn" aria-label="Modifica la posizione">' + IC.edit + '</button></div>';
+    const engineCard = '<div class="card lab-engine"><div class="livebox" style="margin:0;padding:0;border:0"><div class="lh" id="lbHead"></div></div>' +
+      '<div class="progress lab-prog" id="lbProg"><i></i></div><div id="lbBrill"></div><div class="lines" id="lbLines" style="margin-top:8px"></div></div>' +
+      '<button class="btn lab-playbtn" id="lbPlayHere">' + IC.bot + 'Gioca contro il computer da qui</button>';
+    const engineSettings = '<div class="card stack" style="gap:12px">' +
+      '<div class="stack" style="gap:6px"><span class="lbl">Profondità di analisi</span><div class="chips sm" id="lbDepth">' +
+      DEPTH_OPTS.map((d) => '<button aria-pressed="' + (L.depth === d) + '" data-v="' + d + '">' + (d || '∞') + '</button>').join('') + '</div>' +
+      '<span class="dim small" id="lbDepthHint">' + depthHint() + '</span></div>' +
+      '<div class="stack" style="gap:6px"><span class="lbl">Linee mostrate</span><div class="chips sm" id="lbMpv">' +
+      [1, 2, 3, 4, 5].map((n) => '<button aria-pressed="' + (L.multipv === n) + '" data-v="' + n + '">' + n + '</button>').join('') + '</div></div></div>';
+    const posCard = '<div class="card stack" style="gap:10px"><span class="lbl">Posizione</span>' +
       '<div class="row" style="gap:6px;flex-wrap:nowrap"><input type="text" id="lbFen" class="grow num" style="font-size:12.5px" spellcheck="false" autocomplete="off" aria-label="FEN della posizione"><button class="btn sm" id="lbCopy">Copia</button></div>' +
-      '<textarea id="lbPaste" placeholder="Incolla un FEN o un PGN…" spellcheck="false"></textarea>' +
+      (G ? '' : '<textarea id="lbPaste" placeholder="Incolla un FEN o un PGN…" spellcheck="false"></textarea>' +
       '<div class="row" style="gap:6px"><button class="btn sm grow" id="lbLoad">Carica</button>' +
-      (editing ? '' : '<button class="btn sm grow" id="lbNew">Posizione iniziale</button><button class="btn sm grow" id="lbEdit2">Editor</button>') + '</div></div>' +
-      '</div></div>';
+      (editing ? '' : '<button class="btn sm grow" id="lbNew">Posizione iniziale</button><button class="btn sm grow" id="lbEdit2">Editor</button>') + '</div>') + '</div>';
+    const moves = '<div class="moves" id="lbMoves" style="max-height:240px"></div>';
+    let left = '', right = '';
+    if (editing) { left = '<div class="card stack" id="lbEdit" style="gap:12px"></div>'; right = posCard; }
+    else if (G) { left = gameHtml(); right = moves + posCard; }
+    else if (setup) { left = ctrls + setupHtml(); right = moves + posCard; }
+    else { left = ctrls + engineCard; right = engineSettings + moves + posCard; }
+    r.innerHTML = '<h1 class="lab-h">' + (G ? 'Partita dalla tua posizione' : 'Analisi libera') + '</h1><div class="rv"><div class="stack" style="gap:8px">' +
+      '<div class="boardwrap"><div class="evalbar" id="lbEval"><div class="f"></div><div class="t"></div></div><div class="pboard"><div id="lbBoard"></div><div class="promo" id="lbPromo" hidden></div></div></div>' +
+      left + '</div><div class="rv-side stack">' + right + '</div></div>';
     board = new Board(r.querySelector('#lbBoard'), { onMove: userMove });
     // editor taps
     r.querySelector('#lbBoard').addEventListener('click', (ev) => {
@@ -512,6 +691,8 @@ export function createLab(ctx) { // ctx: {root, store, sound, toast, visible()}
     on('#lbFlip', () => { L.flip = !L.flip; save(); drawBoard(false); paintEval(); });
     on('#lbOn', () => { L.on = !L.on; save(); if (L.on) analyze(); else { stopEngine(); paint(); } });
     on('#lbEditBtn', startEdit); on('#lbEdit2', startEdit);
+    on('#lbPlayHere', () => { stopEngine(); L.setupOpen = true; build(); });
+    bindGame();
     on('#lbNew', () => { stopEngine(); setLine(START, [], 0); save(); build(); analyze(); });
     on('#lbLoad', () => loadText(r.querySelector('#lbPaste').value));
     on('#lbCopy', async () => { const v = r.querySelector('#lbFen').value; try { await navigator.clipboard.writeText(v); ctx.toast('FEN copiato'); } catch (e) { r.querySelector('#lbFen').select(); } });
@@ -561,9 +742,9 @@ export function createLab(ctx) { // ctx: {root, store, sound, toast, visible()}
     async show() {
       if (!loaded) { loaded = true; await load(); }
       build();
-      if (L.mode === 'analyze') analyze();
+      if (L.game) { L.game.thinking = false; botMove(); } else if (L.mode === 'analyze' && !L.setupOpen) analyze();
     },
-    hide() { stopEngine(); },
+    hide() { stopEngine(); if (L.game && L.game.thinking) { gtok++; L.game.thinking = false; } },
     async open(fen, label) { if (!loaded) { loaded = true; await load(); } openFen(fen, label); }
   };
 }
