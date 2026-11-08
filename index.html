@@ -45,6 +45,7 @@
           <button class="icon-btn" id="cExplore" aria-label="Esplora con il motore"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg></button>
         </div>
         <div class="coach" id="coach"></div>
+        <button class="btn sm ghost" id="toLab" style="align-self:flex-start">Analizza questa posizione in libertà ›</button>
       </div>
       <div class="rv-side stack">
         <div class="tabs2" role="tablist">
@@ -59,6 +60,8 @@
       </div>
     </div>
   </section>
+  <!-- ANALISI LIBERA -->
+  <section id="v-lab" class="view" hidden></section>
   <!-- STATISTICHE -->
   <section id="v-stats" class="view" hidden></section>
   <!-- GIOCA -->
@@ -70,6 +73,7 @@
 <nav class="nav" aria-label="Sezioni"><div class="nav-in" role="tablist">
   <button data-view="games" aria-selected="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h10"/></svg>Partite</button>
   <button data-view="review" aria-selected="false"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 3h9v9H3zM12 12h9v9h-9z"/><path d="M12 3h9v9h-9zM3 12h9v9H3z" opacity=".35"/></svg>Revisione</button>
+  <button data-view="lab" aria-selected="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6M10 3v6l-5 9a2 2 0 0 0 1.7 3h10.6a2 2 0 0 0 1.7-3l-5-9V3"/><path d="M7.5 15h9"/></svg>Analisi</button>
   <button data-view="play" aria-selected="false"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2a3.5 3.5 0 0 0-2.2 6.2C8.3 9 7.5 10.4 7.5 12h9c0-1.6-.8-3-2.3-3.8A3.5 3.5 0 0 0 12 2zM8.5 13.5c0 2.2-.7 3.8-2 5h11c-1.3-1.2-2-2.8-2-5zM5 20h14v2H5z"/></svg>Gioca</button>
   <button data-view="stats" aria-selected="false"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="3" y="12" width="4" height="9" rx="1"/><rect x="10" y="7" width="4" height="14" rx="1"/><rect x="17" y="3" width="4" height="18" rx="1"/></svg>Statistiche</button>
   <button data-view="puzzle" aria-selected="false"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M10 3a2 2 0 0 1 4 0v2h4a1 1 0 0 1 1 1v4h-1.5a2 2 0 1 0 0 4H19v4a1 1 0 0 1-1 1h-4v-1.5a2 2 0 1 0-4 0V21H6a1 1 0 0 1-1-1v-4h2a2 2 0 1 0 0-4H5V6a1 1 0 0 1 1-1h4z"/></svg>Puzzle</button>

@@ -4,6 +4,7 @@ import { store } from './store.js';
 import * as CC from './chesscom.js';
 import * as LI from './lichess.js';
 import { createPlay } from './play.js';
+import { createLab } from './lab.js';
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -35,7 +36,7 @@ const S = {
   run: { on: false, engines: [], queue: [], override: {}, done: 0, total: 0, games: 0, gamesTotal: 0, t0: 0, label: '' },
   syncing: false, syncMsg: '', limit: 60
 };
-let rvBoard = null, pzBoard = null, liveEngine = null, play = null;
+let rvBoard = null, pzBoard = null, liveEngine = null, play = null, lab = null;
 // all the user's names (Chess.com + Lichess), lower case, joined with |
 const userKey = () => [S.settings.user, S.settings.lichess].map((x) => String(x || '').trim().toLowerCase()).filter(Boolean).join('|');
 
@@ -1322,8 +1323,10 @@ function pzMove(from, to) {
 /* ---------------- navigation ---------------- */
 function show(v) {
   S.view = v;
-  ['games', 'review', 'play', 'stats', 'puzzle'].forEach((k) => { $('v-' + k).hidden = k !== v; });
+  ['games', 'review', 'lab', 'play', 'stats', 'puzzle'].forEach((k) => { $('v-' + k).hidden = k !== v; });
   if (v !== 'play' && play) play.hide();
+  if (v !== 'lab' && lab) lab.hide();
+  if (v === 'lab') getLab().show();
   if (v === 'play') {
     if (!play) play = createPlay({ root: $('v-play'), store, sound, toast, user: () => S.settings.user, profile: () => S.profile, onAnalyze: analyzeBotGame });
     play.show();
@@ -1338,6 +1341,16 @@ function show(v) {
     else { drawReview(false); liveThink(); }
   }
   window.scrollTo(0, 0);
+}
+function getLab() {
+  if (!lab) lab = createLab({ root: $('v-lab'), store, sound, toast, visible: () => S.view === 'lab' });
+  return lab;
+}
+async function openInLab() {
+  if (!S.rv.id) return;
+  const fen = curFen();
+  await getLab().open(fen, 'Posizione aperta in Analisi');
+  show('lab');
 }
 function refresh() {
   if (S.view === 'games') renderGames();
@@ -1391,6 +1404,7 @@ async function boot() {
   $('cFlip').onclick = () => { S.rv.flip = !S.rv.flip; rvBoard.setOrientation(S.rv.flip ? 'b' : 'w'); drawReview(false); };
   $('cExplore').onclick = () => toggleExplore();
   $('cThreat').onclick = showThreat;
+  $('toLab').onclick = openInLab;
   $('moves').onclick = (e) => { const b = e.target.closest('button'); if (b) { if (S.rv.explore) { S.rv.explore = null; stopLive(); } go(0, +b.dataset.ply); drawReview(false); liveThink(); } };
   $('graph').onclick = (e) => { if (!S.rv.id) return; const r = e.currentTarget.getBoundingClientRect(), g = game(S.rv.id); if (S.rv.explore) { S.rv.explore = null; stopLive(); } go(0, Math.round((e.clientX - r.left) / r.width * g.moves.length)); drawReview(false); liveThink(); };
   $('tMoves').onclick = () => { S.rv.tab = 'moves'; $('tMoves').setAttribute('aria-selected', 'true'); $('tSum').setAttribute('aria-selected', 'false'); $('rvMoves').hidden = false; $('rvSum').hidden = true; };

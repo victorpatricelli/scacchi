@@ -87,7 +87,8 @@ export class Engine {
     });
   }
   // Streaming analysis (explorer, live mode): onUpdate(lines, depth) while it thinks
-  think(fen, onUpdate, { multipv = 3, depth = 22 } = {}) {
+  // depth null = no limit (until stop); onDone(result) when the search ends
+  think(fen, onUpdate, { multipv = 3, depth = 22, onDone = null } = {}) {
     return this._exclusive(async () => {
       await this.ready;
       if (this.dead) throw new Error('stopped');
@@ -95,10 +96,10 @@ export class Engine {
       this.setMultiPV(multipv);
       this.lines = [];
       this.listeners.add((lines, d) => onUpdate(lines, d));
-      this.cb = { res: () => {}, rej: () => {} };
+      this.cb = { res: (r) => { if (onDone) onDone(r); }, rej: () => {} };
       this.searching = true;
       this.send('position fen ' + fen);
-      this.send('go depth ' + depth);
+      this.send(depth ? 'go depth ' + depth : 'go infinite');
     });
   }
   stop() { this.listeners.clear(); if (this.searching) this.send('stop'); }
