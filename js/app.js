@@ -1,5 +1,5 @@
 import { Board } from './board.js';
-import { Engine, DEPTHS, poolSize, setEngineMode, engineLabel, ensureEngine, prefetchFull, FULL_BYTES } from './engine.js';
+import { Engine, DEPTHS, poolSize, setEngineMode, engineLabel, ensureEngine, prefetchFull, setFullSource, FULL_BYTES } from './engine.js';
 import { store } from './store.js';
 import * as CC from './chesscom.js';
 import * as LI from './lichess.js';
@@ -442,7 +442,7 @@ async function switchEngine(mode, sel) {
   engDl = true; sel.disabled = true;
   try {
     if (!s.fullReady) {
-      await prefetchFull((p) => say('Scarico il motore completo… ' + Math.round(p * 100) + '%'));
+      s.fullSrc = await prefetchFull((p) => say('Scarico il motore completo… ' + Math.round(p * 100) + '%'));
       s.fullReady = true;
     }
     say('Avvio il motore completo…');
@@ -1413,7 +1413,7 @@ async function boot() {
   try { Core.setBook(await (await fetch('data/openings.json')).json()); } catch (e) { /* no book: classification still works */ }
   try {
     const st = await store.get('settings'); if (st) Object.assign(S.settings, st);
-    setEngineMode(S.settings.engine);
+    setFullSource(S.settings.fullSrc); setEngineMode(S.settings.engine);
     S.profile = (await store.get('profile')) || null;
     S.pz.progress = (await store.get('puzzles')) || {};
     S.pz.themes = (await store.get('pzThemes')) || {};

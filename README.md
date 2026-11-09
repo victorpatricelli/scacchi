@@ -14,7 +14,7 @@ App web per analizzare le partite di Chess.com con Stockfish 19, direttamente ne
 - **Livello stimato** di ogni partita (stile «Game Rating»), precisione per fase, momenti chiave, minaccia dell'avversario
 - Si può muovere direttamente sulla scacchiera durante la revisione: si apre una variante
 - Statistiche solo dalle partite da 3 minuti in su (modificabile nelle impostazioni)
-- **Due motori**: Stockfish 19 lite (≈2 MB, predefinito) oppure, dalle impostazioni, «Analisi massima» con Stockfish 19 completo (rete NNUE intera, ≈100 MB, scaricata una volta sola e tenuta offline)
+- **Due motori**: Stockfish 19 lite (≈2 MB, predefinito) oppure, dalle impostazioni, «Analisi massima» con Stockfish 19 completo (rete NNUE intera, ≈100 MB, scaricata una volta sola dal CDN npm di Stockfish.js e tenuta offline)
 - Installabile come app (PWA), funziona offline, si può condividere una partita dall'app di Chess.com
 
 Tutto resta sul dispositivo (IndexedDB). Backup esportabile dalle impostazioni.

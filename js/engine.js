@@ -2,8 +2,15 @@
 // "lite": small NNUE (~2 MB), the default. "full": the complete NNUE (~100 MB), stronger and more precise.
 const FILES = { lite: 'stockfish-19-lite-single.js', full: 'stockfish-19-single.js' };
 const url = (f) => new URL('../engine/' + f, import.meta.url).href;
-export const FULL_WASM = url('stockfish-19-single.wasm');
+// The full network (~100 MB) is too big for GitHub Pages, so it comes from the npm CDNs that publish
+// Stockfish.js (the loader in engine/ is told where to find it through the URL hash).
+export const FULL_SOURCES = [
+  'https://unpkg.com/stockfish@19.0.1/bin/stockfish-19-single.wasm',
+  'https://cdn.jsdelivr.net/npm/stockfish@19.0.1/bin/stockfish-19-single.wasm'
+];
 export const FULL_BYTES = 99169054;
+let fullSrc = FULL_SOURCES[0];
+export function setFullSource(u) { if (u) fullSrc = u; }
 let MODE = 'lite';
 export function setEngineMode(m) { MODE = m === 'full' ? 'full' : 'lite'; }
 export function engineMode() { return MODE; }
@@ -15,17 +22,28 @@ export function ensureEngine(e) {
   return new Engine();
 }
 // Download the full engine once (the service worker keeps it for offline use), reporting progress 0..1.
-export async function prefetchFull(onProgress) {
-  const res = await fetch(FULL_WASM);
-  if (!res.ok) throw new Error('download non riuscito (' + res.status + ')');
-  if (!res.body || !res.body.getReader) { await res.arrayBuffer(); onProgress(1); return; }
-  const rd = res.body.getReader(); let got = 0;
-  for (;;) {
-    const { done, value } = await rd.read();
-    if (done) break;
-    got += value.length; onProgress(Math.min(0.99, got / FULL_BYTES));
+// Returns the source that worked.
+export async function prefetchFull(onProgress, sources = FULL_SOURCES) {
+  let err = null;
+  for (const src of sources) {
+    try {
+      const res = await fetch(src, { mode: 'cors' });
+      if (!res.ok) throw new Error('download non riuscito (' + res.status + ')');
+      let got = 0;
+      if (res.body && res.body.getReader) {
+        const rd = res.body.getReader();
+        for (;;) {
+          const { done, value } = await rd.read();
+          if (done) break;
+          got += value.length; onProgress(Math.min(0.99, got / FULL_BYTES));
+        }
+      } else got = (await res.arrayBuffer()).byteLength;
+      if (got < FULL_BYTES * 0.9) throw new Error('file incompleto');
+      onProgress(1); fullSrc = src;
+      return src;
+    } catch (e) { err = e; }
   }
-  onProgress(1);
+  throw err || new Error('download non riuscito');
 }
 
 function parseInfo(line) {
@@ -41,7 +59,7 @@ function parseInfo(line) {
 export class Engine {
   constructor(mode) {
     this.mode = mode || MODE;
-    this.w = new Worker(url(FILES[this.mode]));
+    this.w = new Worker(url(FILES[this.mode]) + (this.mode === 'full' ? '#' + encodeURIComponent(fullSrc) : ''));
     this.cb = null; this.lines = []; this.multipv = 1; this.dead = false; this.listeners = new Set();
     this.searching = false; this._idle = []; this._lock = Promise.resolve();
     this.ready = new Promise((res, rej) => {
