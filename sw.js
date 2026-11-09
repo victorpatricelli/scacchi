@@ -1,5 +1,5 @@
 // Offline cache for the app shell and the engine. Chess.com API calls always go to the network.
-const VERSION = 'v8';
+const VERSION = 'v9';
 const SHELL = [
   './', 'index.html', 'css/app.css', 'manifest.webmanifest',
   'js/app.js', 'js/board.js', 'js/engine.js', 'js/store.js', 'js/chesscom.js', 'js/lichess.js', 'js/play.js', 'js/lab.js', 'js/core.js', 'js/chess.js',

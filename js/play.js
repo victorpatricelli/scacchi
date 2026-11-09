@@ -163,7 +163,7 @@ export function createPlay(ctx) { // ctx: {root, store, sound, toast, user(), on
     const c = chess(); if (c.turn() !== P.g.color) return;
     const btn = ctx.root.querySelector('#plHint'); if (btn) btn.disabled = true;
     try {
-      const e = new Engine(); // full strength, separate from the bot
+      const e = new Engine('lite'); // full strength, separate from the bot; the light engine starts at once
       const r = await e.analyze(c.fen(), { depth: 18, movetime: 1500, multipv: 1 });
       e.kill();
       P.g.hints++; save();

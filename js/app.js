@@ -232,6 +232,7 @@ async function startRun() {
   R.on = true; R.t0 = Date.now(); R.done = 0; R.games = 0; R.label = 'Avvio ' + engineLabel() + '…';
   wakeOn(); renderRunBox(); progressTick(true);
   const n = Math.max(1, Math.min(poolSize(), R.queue.length));
+  R.n = n;
   try {
     R.engines = Array.from({ length: n }, () => new Engine());
     await Promise.all(R.engines.map((e) => e.ready));
@@ -346,7 +347,7 @@ function runBoxHtml(ids) {
     return '<div class="row"><span class="spin"></span><b class="grow">Analisi in corso</b><button class="btn sm" id="stopBtn">Ferma</button></div>' +
       '<div class="progress"><i style="width:' + (R.total ? 100 * R.done / R.total : 0) + '%"></i></div>' +
       '<div class="row small"><span class="muted grow" data-t>Partita ' + Math.min(R.games + 1, R.gamesTotal) + ' di ' + R.gamesTotal + ' · ' + esc(R.label) + '</span><span class="dim" data-e></span></div>' +
-      '<div class="dim small">' + engineLabel() + ' su ' + (R.engines.length || '…') + (R.engines.length === 1 ? ' processo' : ' processi') + '. Tieni l\'app aperta: lo schermo resta acceso.</div>';
+      '<div class="dim small">' + engineLabel() + ' su ' + (R.engines.length || R.n || 1) + ((R.engines.length || R.n) === 1 ? ' processo' : ' processi') + '. Tieni l\'app aperta: lo schermo resta acceso.</div>';
   }
   if (todo) {
     const d = DEPTHS[s.depth] || DEPTHS.normal, est = todo * (d.movetime / 1000) * 60 / Math.max(1, poolSize()) / 3;
