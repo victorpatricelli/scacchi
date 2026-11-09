@@ -1,10 +1,11 @@
 // Offline cache for the app shell and the engine. Chess.com API calls always go to the network.
-const VERSION = 'v7';
+const VERSION = 'v8';
 const SHELL = [
   './', 'index.html', 'css/app.css', 'manifest.webmanifest',
   'js/app.js', 'js/board.js', 'js/engine.js', 'js/store.js', 'js/chesscom.js', 'js/lichess.js', 'js/play.js', 'js/lab.js', 'js/core.js', 'js/chess.js',
   'data/openings.json', 'icons/icon-192.png', 'icons/icon.svg',
-  'engine/stockfish-17.1-lite-single-03e3232.js', 'engine/stockfish-17.1-lite-single-03e3232.wasm',
+  'engine/stockfish-19-lite-single.js', 'engine/stockfish-19-lite-single.wasm',
+  // the full engine (~100 MB) is not precached: it is cached the first time it is downloaded
   ...['w', 'b'].flatMap((c) => ['K', 'Q', 'R', 'B', 'N', 'P'].map((p) => 'img/pieces/' + c + p + '.svg'))
 ];
 

@@ -2,7 +2,7 @@
 // Stockfish analyse at the depth you choose. Brilliant and only-moves are always flagged:
 // in the candidate lines, deeper inside the best line, and on the moves you play.
 import { Board } from './board.js';
-import { Engine } from './engine.js';
+import { Engine, ensureEngine, engineLabel } from './engine.js';
 import { LEVELS } from './play.js';
 
 const START = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
@@ -59,7 +59,7 @@ export function createLab(ctx) { // ctx: {root, store, sound, toast, visible()}
   let engine = null, board = null, tok = 0, paintT = 0, clockT = 0, built = false;
   let botEngine = null, gtok = 0;
 
-  function eng() { if (!engine) engine = new Engine(); return engine; }
+  function eng() { engine = ensureEngine(engine); return engine; }
   function save() { ctx.store.set('lab', { fen0: L.fen0, moves: L.moves, ply: L.ply, flip: L.flip, depth: L.depth, multipv: L.multipv, on: L.on, game: L.game ? Object.assign({}, L.game, { thinking: false }) : null, gsetup: L.gsetup }).catch(() => {}); }
   async function load() {
     try {
@@ -204,7 +204,7 @@ export function createLab(ctx) { // ctx: {root, store, sound, toast, visible()}
   }
 
   /* ---------- playing against the computer from any position ---------- */
-  function bot() { if (!botEngine) botEngine = new Engine(); return botEngine; }
+  function bot() { if (!botEngine) botEngine = new Engine('lite'); return botEngine; } // strength-limited bot: the light engine is plenty
   function chessAt(ply) { // with history, so threefold repetition is detected
     const c = new Chess(L.fen0);
     for (let i = 0; i < ply; i++) { const u = L.moves[i]; c.move({ from: u.slice(0, 2), to: u.slice(2, 4), promotion: u[4] || undefined }); }
@@ -505,7 +505,7 @@ export function createLab(ctx) { // ctx: {root, store, sound, toast, visible()}
     if (!L.on && !L.done) return '<span class="dotl done"></span>Motore in pausa' + (L.depthNow ? ' · profondità ' + L.depthNow : '');
     const secs = Math.round((Date.now() - L.t0) / 1000);
     const tgt = L.depth ? '/' + L.depth : '';
-    return '<span class="dotl' + (L.done ? ' done' : '') + '"></span>Stockfish 17.1 · ' +
+    return '<span class="dotl' + (L.done ? ' done' : '') + '"></span>' + engineLabel() + ' · ' +
       (L.depthNow ? 'profondità <b class="num">' + L.depthNow + tgt + '</b>' : 'sto pensando…') +
       (L.done ? ' <span class="ok">✓ completa</span>' : (secs >= 2 ? ' <span class="dim num">· ' + secs + ' s</span>' : '')) +
       (!L.depth && !L.done ? ' <span class="dim">· senza limite</span>' : '');

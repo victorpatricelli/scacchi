@@ -1,5 +1,32 @@
-// Stockfish 17.1 (lite NNUE, single thread) running in Web Workers.
-const ENGINE_URL = new URL('../engine/stockfish-17.1-lite-single-03e3232.js', import.meta.url).href;
+// Stockfish 19 (single thread) running in Web Workers.
+// "lite": small NNUE (~2 MB), the default. "full": the complete NNUE (~100 MB), stronger and more precise.
+const FILES = { lite: 'stockfish-19-lite-single.js', full: 'stockfish-19-single.js' };
+const url = (f) => new URL('../engine/' + f, import.meta.url).href;
+export const FULL_WASM = url('stockfish-19-single.wasm');
+export const FULL_BYTES = 99169054;
+let MODE = 'lite';
+export function setEngineMode(m) { MODE = m === 'full' ? 'full' : 'lite'; }
+export function engineMode() { return MODE; }
+export function engineLabel(m = MODE) { return m === 'full' ? 'Stockfish 19 completo' : 'Stockfish 19'; }
+// Reuse an engine only if it matches the current mode; otherwise replace it.
+export function ensureEngine(e) {
+  if (e && !e.dead && e.mode === MODE) return e;
+  if (e) e.kill();
+  return new Engine();
+}
+// Download the full engine once (the service worker keeps it for offline use), reporting progress 0..1.
+export async function prefetchFull(onProgress) {
+  const res = await fetch(FULL_WASM);
+  if (!res.ok) throw new Error('download non riuscito (' + res.status + ')');
+  if (!res.body || !res.body.getReader) { await res.arrayBuffer(); onProgress(1); return; }
+  const rd = res.body.getReader(); let got = 0;
+  for (;;) {
+    const { done, value } = await rd.read();
+    if (done) break;
+    got += value.length; onProgress(Math.min(0.99, got / FULL_BYTES));
+  }
+  onProgress(1);
+}
 
 function parseInfo(line) {
   if (!line.startsWith('info') || line.indexOf(' score ') < 0 || / (lower|upper)bound/.test(line)) return null;
@@ -12,16 +39,17 @@ function parseInfo(line) {
 }
 
 export class Engine {
-  constructor() {
-    this.w = new Worker(ENGINE_URL);
+  constructor(mode) {
+    this.mode = mode || MODE;
+    this.w = new Worker(url(FILES[this.mode]));
     this.cb = null; this.lines = []; this.multipv = 1; this.dead = false; this.listeners = new Set();
     this.searching = false; this._idle = []; this._lock = Promise.resolve();
     this.ready = new Promise((res, rej) => {
       this._ready = res;
-      this._t = setTimeout(() => rej(new Error('Il motore non risponde')), 45000);
+      this._t = setTimeout(() => rej(new Error('Il motore non risponde')), this.mode === 'full' ? 300000 : 45000);
       this.w.onerror = (e) => { rej(new Error(e.message || 'Errore del motore')); if (this.cb) { this.cb.rej(new Error('engine')); this.cb = null; } };
     });
-    this.w.onmessage = (e) => this.line(String(e.data));
+    this.w.onmessage = (e) => { if (typeof e.data === 'string') this.line(e.data); }; // ignore download-progress objects
     this.send('uci');
     this.send('setoption name Hash value 32');
     this.send('isready');
@@ -117,6 +145,7 @@ export const DEPTHS = {
 };
 
 export function poolSize() {
+  if (MODE === 'full') return 1; // the complete network needs a lot of memory: one process at a time
   const c = navigator.hardwareConcurrency || 2;
   const mem = navigator.deviceMemory || 4;
   return Math.max(1, Math.min(c - 1, mem >= 4 ? 4 : 2, 4));

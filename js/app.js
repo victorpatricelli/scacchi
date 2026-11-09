@@ -1,5 +1,5 @@
 import { Board } from './board.js';
-import { Engine, DEPTHS, poolSize } from './engine.js';
+import { Engine, DEPTHS, poolSize, setEngineMode, engineLabel, ensureEngine, prefetchFull, FULL_BYTES } from './engine.js';
 import { store } from './store.js';
 import * as CC from './chesscom.js';
 import * as LI from './lichess.js';
@@ -26,7 +26,7 @@ const TC_ICON = {
 TC_ICON.all = TC_ICON.rapid;
 
 const S = {
-  settings: { user: 'Victor1186', lichess: '', depth: 'normal', auto: true, sound: true, range: '6', lastSync: 0, synced: false, live: true, statsMin: 180 },
+  settings: { user: 'Victor1186', lichess: '', depth: 'normal', auto: true, sound: true, range: '6', lastSync: 0, synced: false, live: true, statsMin: 180, engine: 'lite' },
   profile: null, recs: new Map(), parsed: {}, reviews: {},
   view: 'games', tc: 'all', stats: { tc: 'all', color: 'all' },
   rv: { id: null, ply: 0, flip: false, tab: 'moves', explore: null, live: null },
@@ -229,7 +229,7 @@ function enqueue(ids, front) {
 }
 async function startRun() {
   const R = S.run;
-  R.on = true; R.t0 = Date.now(); R.done = 0; R.games = 0; R.label = 'Avvio Stockfish 17…';
+  R.on = true; R.t0 = Date.now(); R.done = 0; R.games = 0; R.label = 'Avvio ' + engineLabel() + '…';
   wakeOn(); renderRunBox(); progressTick(true);
   const n = Math.max(1, Math.min(poolSize(), R.queue.length));
   try {
@@ -300,7 +300,7 @@ function renderGames() {
   if (!s.synced && !ids.length) {
     h += '<div class="card hero-cta stack" style="gap:14px;margin-top:6px">' +
       '<div class="board-art"><img src="icons/icon-192.png" alt="" style="width:100%;height:100%"></div>' +
-      '<h1 style="margin:0">Le tue partite, analizzate da Stockfish 17</h1>' +
+      '<h1 style="margin:0">Le tue partite, analizzate da Stockfish 19</h1>' +
       '<p class="muted" style="margin:0">Scarico le partite dal tuo archivio pubblico di Chess.com, le analizzo una per una e ti mostro dove sbagli: pezzo per pezzo, per fase e per tipo di tattica.</p>' +
       '<div class="stack" style="max-width:380px;margin:0 auto;width:100%;text-align:left">' +
       '<label class="lbl" for="uIn">Utente Chess.com</label><input type="text" id="uIn" value="' + esc(s.user) + '" autocomplete="off" autocapitalize="off" spellcheck="false">' +
@@ -346,11 +346,11 @@ function runBoxHtml(ids) {
     return '<div class="row"><span class="spin"></span><b class="grow">Analisi in corso</b><button class="btn sm" id="stopBtn">Ferma</button></div>' +
       '<div class="progress"><i style="width:' + (R.total ? 100 * R.done / R.total : 0) + '%"></i></div>' +
       '<div class="row small"><span class="muted grow" data-t>Partita ' + Math.min(R.games + 1, R.gamesTotal) + ' di ' + R.gamesTotal + ' · ' + esc(R.label) + '</span><span class="dim" data-e></span></div>' +
-      '<div class="dim small">Stockfish 17.1 su ' + (R.engines.length || '…') + (R.engines.length === 1 ? ' processo' : ' processi') + '. Tieni l\'app aperta: lo schermo resta acceso.</div>';
+      '<div class="dim small">' + engineLabel() + ' su ' + (R.engines.length || '…') + (R.engines.length === 1 ? ' processo' : ' processi') + '. Tieni l\'app aperta: lo schermo resta acceso.</div>';
   }
   if (todo) {
     const d = DEPTHS[s.depth] || DEPTHS.normal, est = todo * (d.movetime / 1000) * 60 / Math.max(1, poolSize()) / 3;
-    return '<div class="row"><div class="grow"><b>' + todo + (todo === 1 ? ' partita da analizzare' : ' partite da analizzare') + '</b><div class="dim small">Stockfish 17.1 · profondità ' + d.depth + ' · circa ' + fmtDur(est) + '</div></div></div>' +
+    return '<div class="row"><div class="grow"><b>' + todo + (todo === 1 ? ' partita da analizzare' : ' partite da analizzare') + '</b><div class="dim small">' + engineLabel() + ' · profondità ' + d.depth + ' · circa ' + fmtDur(est) + '</div></div></div>' +
       (todo > 50 ? '<div class="row"><button class="btn primary grow" id="anSome">Le ultime 50</button><button class="btn grow" id="anAll">Tutte</button></div>' : '<button class="btn primary big" id="anAll">Analizza tutte</button>');
   }
   return '<div class="row"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="var(--green)" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5 10 17 19 7"/></svg><div class="grow"><b>Tutte le partite sono analizzate</b><div class="dim small">' + ids.length + ' partite · le nuove vengono analizzate ' + (s.auto ? 'da sole' : 'quando premi Analizza') + '</div></div></div>';
@@ -394,6 +394,7 @@ function settingsHtml() {
     '<div class="stack"><label class="lbl" for="sRange">Partite da scaricare</label><select id="sRange">' + rangeOpts() + '</select></div>' +
     '<div class="stack"><label class="lbl" for="sStatsMin">Partite nelle statistiche</label><select id="sStatsMin">' + [[0, 'Tutte, anche bullet'], [180, 'Da 3 minuti in su'], [600, 'Da 10 minuti in su']].map(([v, l]) => '<option value="' + v + '"' + (+s.statsMin === v ? ' selected' : '') + '>' + l + '</option>').join('') + '</select></div>' +
     '<div class="stack"><label class="lbl" for="sDepth">Profondità di analisi</label><select id="sDepth">' + Object.entries(DEPTHS).map(([k, d]) => '<option value="' + k + '"' + (s.depth === k ? ' selected' : '') + '>' + d.label + ' · profondità ' + d.depth + '</option>').join('') + '</select></div>' +
+    '<div class="stack"><label class="lbl" for="sEngine">Motore</label><select id="sEngine">' + [['lite', 'Stockfish 19 veloce · 2 MB'], ['full', 'Analisi massima · 100 MB']].map(([v, l]) => '<option value="' + v + '"' + ((s.engine || 'lite') === v ? ' selected' : '') + '>' + l + '</option>').join('') + '</select><span class="dim small" id="sEngMsg">' + engNote(s.engine) + '</span></div>' +
     '<div class="stack"><span class="lbl">Opzioni</span><label class="row small"><input type="checkbox" id="sAuto"' + (s.auto ? ' checked' : '') + '> Analizza da sola le partite nuove</label><label class="row small"><input type="checkbox" id="sSound"' + (s.sound ? ' checked' : '') + '> Suoni delle mosse</label></div></div>' +
     '<div class="stack"><label class="lbl" for="pgnIn">Importa PGN (incolla o scegli un file)</label><textarea id="pgnIn" placeholder="[Event &quot;Live Chess&quot;] …"></textarea>' +
     '<div class="row"><button class="btn sm" id="pgnBtn">Importa testo</button><label class="btn sm" for="pgnFile">Scegli file<input type="file" id="pgnFile" accept=".pgn,.txt,text/plain" multiple hidden></label></div></div>' +
@@ -407,6 +408,7 @@ function bindSettings() {
   on('sLichess', 'change', (e) => { s.lichess = e.target.value.trim(); S.parsed = {}; S.reviews = {}; saveSettings(); sync(true); });
   on('sRange', 'change', (e) => { s.range = e.target.value; saveSettings(); sync(true); });
   on('sDepth', 'change', (e) => { s.depth = e.target.value; saveSettings(); });
+  on('sEngine', 'change', (e) => switchEngine(e.target.value, e.target));
   on('sStatsMin', 'change', (e) => { s.statsMin = +e.target.value; saveSettings(); });
   on('sAuto', 'change', (e) => { s.auto = e.target.checked; saveSettings(); });
   on('sSound', 'change', (e) => { s.sound = e.target.checked; saveSettings(); });
@@ -419,6 +421,39 @@ function bindSettings() {
     const list = [...S.recs.values()]; list.forEach((r) => { r.an = null; r.rv = null; r.sum = null; }); S.reviews = {};
     store.putGames(list).then(analyzeAll);
   });
+}
+const engNote = (m) => m === 'full' ? 'Stockfish 19 completo: più preciso, ma analizza una partita alla volta.' : 'Il completo vede più a fondo: utile per l\'analisi notturna.';
+let engDl = false;
+async function switchEngine(mode, sel) {
+  const s = S.settings;
+  const say = (t) => { const m = $('sEngMsg'); if (m) m.textContent = t; };
+  const apply = (m) => {
+    s.engine = m; setEngineMode(m); saveSettings();
+    if (liveEngine) { liveEngine.kill(); liveEngine = null; }
+    S.lineCache = {};
+    say(engNote(m));
+    toast(engineLabel(m) + ' attivo' + (S.run.on ? ' dalla prossima analisi' : ''));
+    if (S.view === 'games' && !S.run.on) renderRunBox();
+  };
+  if (mode !== 'full') { apply('lite'); return; }
+  if (engDl) { sel.value = s.engine || 'lite'; return; }
+  if (!s.fullReady && !confirm('Il motore completo pesa circa ' + Math.round(FULL_BYTES / 1e6) + ' MB e si scarica una volta sola. Meglio in Wi-Fi. Procedo?')) { sel.value = s.engine || 'lite'; return; }
+  engDl = true; sel.disabled = true;
+  try {
+    if (!s.fullReady) {
+      await prefetchFull((p) => say('Scarico il motore completo… ' + Math.round(p * 100) + '%'));
+      s.fullReady = true;
+    }
+    say('Avvio il motore completo…');
+    const t = new Engine('full'); await t.ready; t.kill(); // check it really starts on this phone
+    apply('full');
+  } catch (e) {
+    s.fullReady = false; saveSettings();
+    sel.value = s.engine || 'lite';
+    say('Non sono riuscito ad attivare il motore completo: resta quello veloce.');
+    toast('Motore completo non disponibile: ' + (e.message || 'errore'));
+  }
+  engDl = false; sel.disabled = false;
 }
 function analyzeBotGame(text) {
   const g = Core.parseMeta(text, userKey());
@@ -683,7 +718,7 @@ function bestLine(g, ply0, m) {
   if (c && c !== 'wait') return c;
   if (!c) {
     S.lineCache[k] = 'wait';
-    if (!liveEngine) liveEngine = new Engine();
+    liveEngine = ensureEngine(liveEngine);
     liveEngine.analyze(g.fens[ply0], { depth: 18, movetime: 2500, multipv: 1 }).then((r) => {
       const pv = r.lines[0] && r.lines[0].pv;
       S.lineCache[k] = pv && pv.length ? (pv[0].slice(0, 4) === m.best.slice(0, 4) ? pv : [m.best]).slice(0, 7) : [m.best];
@@ -761,7 +796,7 @@ async function showThreat() {
   if (ch.in_check()) { toast('Sei già sotto scacco: la minaccia è sulla scacchiera'); return; }
   const parts = fen.split(' '); parts[1] = parts[1] === 'w' ? 'b' : 'w'; parts[3] = '-';
   const nf = parts.join(' ');
-  if (!liveEngine) liveEngine = new Engine();
+  liveEngine = ensureEngine(liveEngine);
   const T = S.rv.threat = { fen, wait: true };
   drawReview(false);
   try {
@@ -898,7 +933,7 @@ function think() {
   const ex = S.rv.explore; if (!ex || (ex.retry && !ex.retry.done)) return;
   const fen = ex.fens[ex.fens.length - 1];
   if (new Chess(fen).game_over()) { ex.lines = []; return; }
-  if (!liveEngine) liveEngine = new Engine();
+  liveEngine = ensureEngine(liveEngine);
   liveEngine.think(fen, (lines, depth) => {
     if (S.rv.explore !== ex || ex.fens[ex.fens.length - 1] !== fen) return;
     ex.lines = lines; ex.depth = depth;
@@ -923,7 +958,7 @@ async function liveThink() {
   if (!S.settings.live || S.rv.explore || S.view !== 'review' || !S.rv.id) return;
   const id = S.rv.id, g = game(id), ply = S.rv.ply, tok = ++liveTok;
   if (!g) return;
-  if (!liveEngine) liveEngine = new Engine();
+  liveEngine = ensureEngine(liveEngine);
   const fen = g.fens[ply], ch = new Chess(fen);
   try {
     // to judge the move just played we also need the position before it
@@ -1377,6 +1412,7 @@ async function boot() {
   try { Core.setBook(await (await fetch('data/openings.json')).json()); } catch (e) { /* no book: classification still works */ }
   try {
     const st = await store.get('settings'); if (st) Object.assign(S.settings, st);
+    setEngineMode(S.settings.engine);
     S.profile = (await store.get('profile')) || null;
     S.pz.progress = (await store.get('puzzles')) || {};
     S.pz.themes = (await store.get('pzThemes')) || {};

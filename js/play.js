@@ -26,7 +26,7 @@ function fmtClock(s) { s = Math.max(0, s); const m = Math.floor(s / 60), x = s %
 export function createPlay(ctx) { // ctx: {root, store, sound, toast, user(), onAnalyze(pgn), profile()}
   const P = { setup: { level: 4, color: 'w', clock: 'none' }, g: null, engine: null, board: null, timer: null, thinking: false };
 
-  function engine() { if (!P.engine) P.engine = new Engine(); return P.engine; }
+  function engine() { if (!P.engine) P.engine = new Engine('lite'); return P.engine; } // strength-limited bot: the light engine is plenty
   function lvl() { return LEVELS.find((l) => l.n === (P.g ? P.g.level : P.setup.level)) || LEVELS[3]; }
   function save() { ctx.store.set('play', { setup: P.setup, g: P.g }).catch(() => {}); }
 
